@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   discoverAndLoadExtensions,
   type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
+import {
+  PREFLIGHT_MARKER,
+  PREFLIGHT_SECTION,
+  type PreflightPromptEvent,
+} from "../src/prompt-guidance.js";
 import { sourceState } from "./source-state.js";
 
 const root = path.resolve(import.meta.dirname, "..");
@@ -16,6 +21,8 @@ const previousManagedConfig = process.env.PI_FILE_TOOLS_CONFIG;
 process.env.PI_FILE_TOOLS_CONFIG = path.join(agentDir, "file-tools.json");
 delete process.env.PI_FILE_TOOLS_HOME;
 const configuredRoot = path.join(agentDir, "configured-managed");
+const agentRulesFile = path.join(agentDir, "AGENTS.md");
+await writeFile(agentRulesFile, "HOST PROJECT RULES\n");
 await writeFile(
   process.env.PI_FILE_TOOLS_CONFIG,
   JSON.stringify({
@@ -122,6 +129,57 @@ try {
       context,
     );
     assert.ok(listed.structuredContent);
+    const hooks = ours.handlers.get("before_agent_start");
+    assert.equal(hooks?.length, 1);
+    const hook = hooks[0] as (
+      event: PreflightPromptEvent,
+      context: ExtensionToolContext,
+    ) => unknown;
+    const promptOptions: NonNullable<
+      PreflightPromptEvent["systemPromptOptions"]
+    > = { sections: { foreign: "KEEP" } };
+    const promptEvent = {
+      type: "before_agent_start",
+      messageType: "user",
+      prompt: "Host preflight probe",
+      systemPrompt: "HOST PROMPT",
+      systemPromptOptions: promptOptions,
+    };
+    const markerCount = () =>
+      (
+        promptOptions.forceSystemPrompt ??
+        promptOptions.sections?.[PREFLIGHT_SECTION] ??
+        ""
+      ).split(PREFLIGHT_MARKER).length - 1;
+    await hook(promptEvent, context);
+    assert.equal(markerCount(), 1);
+    await hook(promptEvent, context);
+    assert.equal(markerCount(), 1);
+    const configFile = process.env.PI_FILE_TOOLS_CONFIG;
+    assert.ok(configFile);
+    const fixtureSettings = JSON.parse(await readFile(configFile, "utf8"));
+    fixtureSettings.preflightPrompt = false;
+    await writeFile(configFile, JSON.stringify(fixtureSettings));
+    await hook(promptEvent, context);
+    assert.equal(markerCount(), 0);
+    assert.equal(promptOptions.sections?.foreign, "KEEP");
+    fixtureSettings.preflightPrompt = true;
+    await writeFile(configFile, JSON.stringify(fixtureSettings));
+    promptOptions.forceSystemPrompt = "HOST FORCED PREFIX";
+    await hook(promptEvent, context);
+    await hook(promptEvent, context);
+    assert.equal(markerCount(), 1);
+    assert.ok(promptOptions.forceSystemPrompt.startsWith("HOST FORCED PREFIX"));
+    fixtureSettings.preflightPrompt = false;
+    await writeFile(configFile, JSON.stringify(fixtureSettings));
+    await hook(promptEvent, context);
+    assert.equal(promptOptions.forceSystemPrompt, "HOST FORCED PREFIX");
+    fixtureSettings.preflightPrompt = true;
+    await writeFile(configFile, JSON.stringify(fixtureSettings));
+    assert.equal(
+      await readFile(agentRulesFile, "utf8"),
+      "HOST PROJECT RULES\n",
+    );
     const entry = {
       round,
       tools: names,
@@ -138,7 +196,22 @@ try {
       warnings: result.warnings ?? [],
       hostVersion: "1.6.0",
       modelRequests: 0,
-      executed: ["mkdir", "temp:create", "backup:policy", "trash:list"],
+      executed: [
+        "mkdir",
+        "temp:create",
+        "backup:policy",
+        "trash:list",
+        "before_agent_start:preflight:on-off",
+      ],
+      preflightVerified: {
+        registered: true,
+        enabledBeforeToggle: true,
+        hotToggle: true,
+        idempotent: true,
+        forcedPromptFallback: true,
+        agentsFileUnchanged: true,
+        scope: "actual loaded callback with in-memory event; no model request",
+      },
       settingsVerified: {
         storageRoot: configuredRoot,
         tempTtlHours: 6,

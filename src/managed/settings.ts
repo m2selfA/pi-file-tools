@@ -19,6 +19,7 @@ import { noLinks } from "./tree.js";
 export interface ManagedSettings {
   version: 1;
   storageRoot?: string;
+  preflightPrompt?: boolean;
   policies?: Partial<Record<Category, Partial<Policy>>>;
 }
 
@@ -60,6 +61,7 @@ export function defaultSettings(): ManagedSettings {
     !path.isAbsolute(relative);
   return {
     version: 1,
+    preflightPrompt: true,
     storageRoot: portable ? `~/${relative.split(path.sep).join("/")}` : root,
     policies: structuredClone(DEFAULT_POLICIES),
   };
@@ -73,7 +75,10 @@ export function parseSettings(value: unknown): ManagedSettings {
   if (
     !object(value) ||
     Object.keys(value).some(
-      (key) => !["version", "storageRoot", "policies"].includes(key),
+      (key) =>
+        !["version", "storageRoot", "preflightPrompt", "policies"].includes(
+          key,
+        ),
     )
   )
     throw new Error("Unknown settings field or invalid settings object.");
@@ -84,6 +89,11 @@ export function parseSettings(value: unknown): ManagedSettings {
       throw new Error("storageRoot must be a path string.");
     resolveStorageRoot(value.storageRoot);
   }
+  if (
+    value.preflightPrompt !== undefined &&
+    typeof value.preflightPrompt !== "boolean"
+  )
+    throw new Error("preflightPrompt must be a boolean.");
   if (value.policies !== undefined) {
     if (
       !object(value.policies) ||
@@ -109,6 +119,9 @@ export function parseSettings(value: unknown): ManagedSettings {
     version: 1,
     ...(typeof value.storageRoot === "string"
       ? { storageRoot: value.storageRoot }
+      : {}),
+    ...(typeof value.preflightPrompt === "boolean"
+      ? { preflightPrompt: value.preflightPrompt }
       : {}),
     ...(value.policies !== undefined ? { policies } : {}),
   };

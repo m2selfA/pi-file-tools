@@ -59,6 +59,7 @@ test("settings expand ~ and both separator styles using the user HOME", () => {
 test("default settings and packaged example preserve the established limits", async () => {
   assert.equal(path.basename(defaultSettingsPath()), "file-tools.json");
   assert.deepEqual(defaultSettings().policies, DEFAULT_POLICIES);
+  assert.equal(defaultSettings().preflightPrompt, true);
   const example = parseSettings(
     JSON.parse(
       await readFile(
@@ -68,6 +69,7 @@ test("default settings and packaged example preserve the established limits", as
     ),
   );
   assert.equal(example.storageRoot, "~/.pi/agent/file-tools");
+  assert.equal(example.preflightPrompt, true);
   assert.deepEqual(example.policies, DEFAULT_POLICIES);
 });
 

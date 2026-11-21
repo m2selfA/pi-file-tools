@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "0.2.1",
+  "packageVersion": "0.2.2",
   "status": "passed-with-platform-gaps",
-  "verifiedAtUtc": "2026-11-21T14:13:46.921Z",
-  "sourceInputDigest": "c0939463a7b7beddae91abe26cda9158001e731ca1756c081005fba83c1ce2b7",
+  "verifiedAtUtc": "2026-11-21T15:12:40.886Z",
+  "sourceInputDigest": "7a155d52cec8962cd9a9a8519d312165ec4f639fe05ad283106a59fdba1426fd",
   "hashScope": "Files selected by scripts/source-state.ts; not a Git commit, binary or memory-image hash.",
   "environment": {
     "platform": "win32",
@@ -12,7 +12,7 @@
   },
   "results": {
     "unit": {
-      "passed": 60,
+      "passed": 74,
       "failed": 0
     },
     "officialLoader": {
@@ -39,6 +39,20 @@
     "linuxNative": {
       "status": "skipped-on-windows",
       "nativeHostVerified": false
+    },
+    "preflightPrompt": {
+      "enabledByDefault": true,
+      "configurationKey": "preflightPrompt",
+      "newUnitCases": 14,
+      "actualLoaderCallbackVerified": true,
+      "nextRunToggleVerified": true,
+      "idempotencyVerified": true,
+      "hiddenAndCustomPromptRenderingVerified": true,
+      "existingForcedPromptFallbackVerified": true,
+      "stringOnlyEventFixtureVerified": true,
+      "agentsFileEdits": false,
+      "modelRequests": 0,
+      "scope": "Registered callback and SDK prompt construction; no real provider request or model-adherence measurement."
     }
   },
   "rawEvidence": {
@@ -49,6 +63,8 @@
     "No independent advisor approval is claimed.",
     "Long real-time expiry and recycle retention were not waited out.",
     "Validation maxima do not establish maximum-capacity throughput.",
-    "Linux native integration requires a Linux host."
+    "Linux native integration requires a Linux host.",
+    "Preflight verification does not establish real provider payload delivery or model adherence.",
+    "Later full-prompt replacement handlers can still override prior guidance."
   ]
 }

@@ -1,6 +1,7 @@
 {
   "version": 1,
   "storageRoot": "~/.pi/agent/file-tools",
+  "preflightPrompt": true,
   "policies": {
     "backup": {
       "ttlHours": "30d",

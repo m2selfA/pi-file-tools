@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 - 2026-11-21
+
+- Add a default-on `before_agent_start` preflight prompt, configurable with the top-level boolean `preflightPrompt`.
+- Reload the switch on each run, preserve AGENTS files and unrelated prompt content, and deduplicate the owned prompt section.
+- Cover hidden tools, custom prefixes, existing forced prompts and string-only event shapes; verify the actual loader callback without model requests.
+
+
 ## 0.2.1 - 2026-11-21
 
 - Accept binary human-readable count/size strings and duration strings in settings and Pi tool inputs; preserve their spelling when saving policies.

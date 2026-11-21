@@ -120,6 +120,16 @@ pi install .
 
 两个工具都支持 `create`、`list`、`inspect`、`restore`、`release`、`cleanup`、`policy`、`pin`、`touch`。`cleanup` 默认只返回计划，必须显式 `execute:true` 才会操作。临时项创建后有 15 分钟租约，`touch` 可续租；`pinned:true` 项不会自动释放。
 
+### 预先提示（默认开启）
+
+插件通过 `before_agent_start` 在每次 agent 运行开始前添加 `pi_file_tools` 提示段，提醒先用 `temp` 分配临时路径、在重要覆盖或迁移前用 `backup` 建立恢复点。不改写磁盘上的 `AGENTS.md`，也不会在每一轮自动创建临时项或备份。
+
+顶层布尔项 `preflightPrompt` 默认为 `true`，旧配置省略它也会开启。要关闭，在现有设置中添加或修改 `"preflightPrompt": false`，保留其他字段。加载新版代码后，开关在下一次 agent 运行开始时读取，无需为开关变化再次重启。
+
+关闭只移除新增的独立预先提示；工具仍可使用，原有工具说明和 `promptGuidelines` 保留。固定段名用于去重；已有强制提示或字符串事件使用带标记的追加块，保留其他前后文。插件只删除自己当前的完整提示块，不按宽泛标记删除用户文本。
+
+独立段不依赖原生工具指南是否可见，也适用于自定义提示前缀。其他扩展若在之后全量替换提示，仍可能覆盖它。提示注入是行为引导，不是文件系统拦截；最终提供商请求与真实模型调用顺序需要另行验收。
+
 ### 设置文件
 
 默认读取 `~/.pi/agent/file-tools.json`（自定义 `PI_CODING_AGENT_DIR` 时跟随 agent 目录）。随包提供 [file-tools.example.json](./file-tools.example.json)，可复制后编辑；不把用户配置放进数据目录。`PI_FILE_TOOLS_CONFIG` 可指定其他设置文件，路径同样支持 `~`。
@@ -128,6 +138,7 @@ pi install .
 {
   "version": 1,
   "storageRoot": "~/.pi/agent/file-tools",
+  "preflightPrompt": true,
   "policies": {
     "backup": {
       "ttlHours": "30d",

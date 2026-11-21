@@ -15,6 +15,12 @@
 
 On Windows, also run `powershell -NoProfile -File ./scripts/native-audit.ps1` to check the PowerShell AST, C# declarations and four callback guards. Native tests may permanently remove only their own fresh fixture IDs; they do not clear the user's entire recycle bin.
 
+## Preflight prompt checks
+
+The preflight tests render prompts using the locked development SDK and cover default-on behavior, explicit disable, next-run settings reload, fixed-key deduplication, hidden tools, custom prefixes, existing forced prompts and string-only event fixtures. They also check strict boolean parsing, preservation during policy saves, and no managed-store creation or AGENTS modification by the hook.
+
+The official-loader smoke test invokes the actual registered `before_agent_start` callback in each loader round, toggles an isolated settings file, and checks owned marker presence, deduplication and forced-prefix preservation. This is callback/prompt-construction evidence, not an actual provider request or a measurement of model compliance. Later handlers that replace the entire prompt may still discard prior additions.
+
 ## Evidence boundaries
 
 - The public summary is derived from local receipts. The private raw receipts are preserved separately and are not independently inspectable from this repository. No independent advisor approval is claimed.

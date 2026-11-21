@@ -5,6 +5,7 @@ import { managedSchema } from "./managed/index.js";
 import type { Category } from "./managed/model.js";
 import type { ManagedInput, StoreOptions } from "./managed/store.js";
 import { ManagedStore } from "./managed/store.js";
+import { registerPreflightPrompt } from "./prompt-guidance.js";
 import { createTrashBackend } from "./trash/index.js";
 import { serializedBackend, TrashOperations } from "./trash/service.js";
 import type { OperationResult, TrashBackend } from "./types.js";
@@ -55,6 +56,8 @@ export function registerFileTools(
   const files = new FileOperations(trash);
   const recycle = new TrashOperations(trash);
   const managed = new ManagedStore(trash, { ...options, files });
+  if (typeof pi.on === "function")
+    registerPreflightPrompt(pi, managed.settingsPath);
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
   const managedTool = (category: Category, label: string) => ({
     name: category,
