@@ -100,6 +100,24 @@ namespace PiFileTools {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool MoveFileExW(string source, string destination, uint flags);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AttributeTagInfo { public uint Attributes; public uint Tag; }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle handle, int infoClass, out AttributeTagInfo info, uint size);
+    public static string LinkKind(string path) {
+      // Read the reparse point itself: never open its target or request write access.
+      using (Microsoft.Win32.SafeHandles.SafeFileHandle handle = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+        if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        AttributeTagInfo info;
+        if (!GetFileInformationByHandleEx(handle, 9, out info, (uint)Marshal.SizeOf(typeof(AttributeTagInfo)))) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        if (info.Tag == 0xA0000003) return "junction";
+        if (info.Tag == 0xA000000C) return (info.Attributes & 0x10) != 0 ? "dir" : "file";
+        throw new IOException("Unsupported reparse-point kind; no target was followed.");
+      }
+    }
     private static void Check(int hr) { if (hr < 0) Marshal.ThrowExceptionForHR(hr); }
     public static string PathOf(IShellItem item) {
       IntPtr text; int hr = item.GetDisplayName(0x80028000, out text);

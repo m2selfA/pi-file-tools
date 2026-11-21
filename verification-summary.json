@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "0.2.2",
+  "packageVersion": "0.2.3",
   "status": "passed-with-platform-gaps",
-  "verifiedAtUtc": "2026-11-21T15:12:40.886Z",
-  "sourceInputDigest": "7a155d52cec8962cd9a9a8519d312165ec4f639fe05ad283106a59fdba1426fd",
+  "verifiedAtUtc": "2026-11-21T17:02:14.213Z",
+  "sourceInputDigest": "d94de8066ec319ceb3f8c17cf684472dccf96488e6503d0ae7e9218a6591ac90",
   "hashScope": "Files selected by scripts/source-state.ts; not a Git commit, binary or memory-image hash.",
   "environment": {
     "platform": "win32",
@@ -12,7 +12,7 @@
   },
   "results": {
     "unit": {
-      "passed": 74,
+      "passed": 87,
       "failed": 0
     },
     "officialLoader": {
@@ -53,6 +53,29 @@
       "agentsFileEdits": false,
       "modelRequests": 0,
       "scope": "Registered callback and SDK prompt construction; no real provider request or model-adherence measurement."
+    },
+    "managedLinks": {
+      "tempLinks": "opaque leaves; target contents excluded",
+      "backupLinks": "strict rejection",
+      "scanFailures": "per-item health, not mutation state",
+      "unknownUsage": "explicit; related-category admission blocked",
+      "targetOperations": "do not refresh unrelated items",
+      "legacyBackupDigests": "golden-format fixture passed",
+      "initialSweepFailure": "timer registered and retry verified",
+      "confirmedVsUnconfirmedRecovery": "separate state-machine cases verified",
+      "nativeWindows": {
+        "requiredJunctionGatePassed": true,
+        "symbolicLinkGate": "passed",
+        "typesVerified": ["junction", "file", "dir"],
+        "externalSentinelsUnchanged": true,
+        "recycleRestoreAndPurge": true
+      },
+      "reportedRealCase": {
+        "readonlyScanPassed": true,
+        "cleanupPreviewsPassed": true,
+        "linkedSdkContentsTraversed": false,
+        "userDataMutations": 0
+      }
     }
   },
   "rawEvidence": {
@@ -65,6 +88,8 @@
     "Validation maxima do not establish maximum-capacity throughput.",
     "Linux native integration requires a Linux host.",
     "Preflight verification does not establish real provider payload delivery or model adherence.",
-    "Later full-prompt replacement handlers can still override prior guidance."
+    "Later full-prompt replacement handlers can still override prior guidance.",
+    "Recreating Windows file/directory symbolic links requires OS permission; unavailable privilege is reported or skipped, never enabled by the plugin.",
+    "Relative link targets are preserved verbatim and resolve relative to the restored location."
   ]
 }

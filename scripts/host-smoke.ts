@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -129,6 +137,110 @@ try {
       context,
     );
     assert.ok(listed.structuredContent);
+    const linked = await temp.definition.execute(
+      `linked-${round}`,
+      {
+        action: "create",
+        kind: "directory",
+        name: `linked-${round}`,
+        purpose: "startup nested-link fixture",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    const linkedItem = (
+      linked.structuredContent as unknown as {
+        result: { item: { id: string; path: string } };
+      }
+    ).result.item;
+    const outsideSdk = path.join(agentDir, `outside-sdk-${round}`);
+    await mkdir(outsideSdk);
+    await writeFile(path.join(outsideSdk, "keep.txt"), "KEEP SDK TARGET");
+    await mkdir(path.join(linkedItem.path, "node_modules"));
+    await symlink(
+      outsideSdk,
+      path.join(linkedItem.path, "node_modules", "@earendil-works"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const damaged = await temp.definition.execute(
+      `damaged-${round}`,
+      {
+        action: "create",
+        name: `damaged-${round}`,
+        content: "repair me",
+        purpose: "startup isolated inspection error",
+      },
+      undefined,
+      undefined,
+      context,
+    );
+    const damagedItem = (
+      damaged.structuredContent as unknown as {
+        result: { item: { id: string; path: string } };
+      }
+    ).result.item;
+    await unlink(damagedItem.path);
+    const startHooks = ours.handlers.get("session_start");
+    const stopHooks = ours.handlers.get("session_shutdown");
+    assert.equal(startHooks?.length, 1);
+    assert.equal(stopHooks?.length, 1);
+    const start = startHooks[0] as (
+      event: unknown,
+      ctx: unknown,
+    ) => Promise<void>;
+    const stop = stopHooks[0] as (
+      event: unknown,
+      ctx: unknown,
+    ) => Promise<void>;
+    const originalWarn = console.warn;
+    const maintenanceWarnings: string[] = [];
+    console.warn = (...args: unknown[]) => {
+      maintenanceWarnings.push(args.join(" "));
+    };
+    try {
+      await start({ type: "session_start" }, { cwd: agentDir, hasUI: false });
+      assert.equal(maintenanceWarnings.length, 1);
+      assert.ok(maintenanceWarnings[0].includes(damagedItem.id));
+      const inspectDamage = await temp.definition.execute(
+        `inspect-damage-${round}`,
+        { action: "inspect", id: damagedItem.id },
+        undefined,
+        undefined,
+        context,
+      );
+      const damagedState = (
+        inspectDamage.structuredContent as unknown as {
+          result: { item: { state: string; inspectionError?: string } };
+        }
+      ).result.item;
+      assert.equal(damagedState.state, "active");
+      assert.ok(damagedState.inspectionError);
+      await writeFile(damagedItem.path, "repair me");
+      await start({ type: "session_start" }, { cwd: agentDir, hasUI: false });
+      assert.equal(maintenanceWarnings.length, 1);
+      const healthy = await temp.definition.execute(
+        `inspect-link-${round}`,
+        { action: "inspect", id: linkedItem.id },
+        undefined,
+        undefined,
+        context,
+      );
+      const linkState = (
+        healthy.structuredContent as unknown as {
+          result: { item: { linkCount: number; inspectionError?: string } };
+        }
+      ).result.item;
+      assert.equal(linkState.linkCount, 1);
+      assert.equal(linkState.inspectionError, undefined);
+      assert.equal(
+        await readFile(path.join(outsideSdk, "keep.txt"), "utf8"),
+        "KEEP SDK TARGET",
+      );
+    } finally {
+      console.warn = originalWarn;
+      await stop({ type: "session_shutdown" }, { cwd: agentDir, hasUI: false });
+    }
     const hooks = ours.handlers.get("before_agent_start");
     assert.equal(hooks?.length, 1);
     const hook = hooks[0] as (
@@ -211,6 +323,15 @@ try {
         forcedPromptFallback: true,
         agentsFileUnchanged: true,
         scope: "actual loaded callback with in-memory event; no model request",
+      },
+      startupIsolationVerified: {
+        nestedLinkScannedWithoutDereference: true,
+        oneBlockedItemReported: true,
+        mutationStatePreserved: true,
+        recoveryOnNextSweep: true,
+        timerShutdownInvoked: true,
+        externalTargetUnchanged: true,
+        scope: "actual loaded startup callback against isolated fixtures",
       },
       settingsVerified: {
         storageRoot: configuredRoot,

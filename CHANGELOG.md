@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3 - 2026-11-21
+
+- Treat nested temp symlinks/junctions as opaque leaves without scanning target contents; retain strict backups and root redirection guards.
+- Preserve Windows link type and raw targets during temp restore using bounded read-only reparse metadata queries.
+- Isolate inspection errors from mutation states and report partial maintenance with explicit unknown usage.
+- Use target-level recovery/release/touch checks, category-level admission, and timers independent of first-sweep success.
+- Add native deep-link lifecycle, old-digest compatibility and confirmed-versus-uncertain recovery gates.
+
+
 ## 0.2.2 - 2026-11-21
 
 - Add a default-on `before_agent_start` preflight prompt, configurable with the top-level boolean `preflightPrompt`.

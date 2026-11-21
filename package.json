@@ -1,6 +1,6 @@
 {
   "name": "@m2selfa/pi-file-tools",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Pi file tools with Windows/Linux trash, centralized backups and temporary resources",
   "type": "module",
   "private": true,
@@ -43,6 +43,7 @@
     "format": "biome check --write .",
     "test": "tsx --test test/*.test.ts",
     "test:windows": "tsx --test test/windows.integration.ts",
+    "test:links:windows": "tsx --test test/windows-links.integration.ts",
     "test:linux": "tsx --test test/linux.integration.ts",
     "test:host": "tsx scripts/host-smoke.ts",
     "test:scale": "tsx --test test/managed-scale.integration.ts",

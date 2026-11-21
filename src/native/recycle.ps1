@@ -28,6 +28,12 @@ try {
   } else {
     Add-Type -Path (Join-Path $PSScriptRoot 'Recycle.cs')
     switch ($request.action) {
+      'linkKinds' {
+        $paths=@($request.paths)
+        if ($paths.Count -gt 128) { throw 'Link metadata query exceeds 128 entries.' }
+        $items=@(foreach ($p in $paths) { if (!$p) { throw 'Missing link path.' }; @{path=[string]$p; kind=[PiFileTools.Native]::LinkKind([string]$p)} })
+        $response=@{items=$items}
+      }
       'moveNoReplace' { [PiFileTools.Native]::MoveNoReplace($request.source, $request.destination); $response=@{destination=$request.destination} }
       'put' {
         $before = @(Get-RecycledItems)

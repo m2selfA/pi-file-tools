@@ -94,14 +94,27 @@ export function registerFileTools(
   });
   pi.registerTool(managedTool("backup", "Managed backups"));
   pi.registerTool(managedTool("temp", "Managed temporary files"));
+  const reportMaintenance = (result: OperationResult): string | undefined => {
+    const failed = Array.isArray(result.failed)
+      ? (result.failed as { id: string; error: string }[])
+      : [];
+    if (!failed.length) return undefined;
+    const message = `Managed maintenance partial: ${failed.length} item(s) need attention; inspect ${failed
+      .slice(0, 8)
+      .map((i) => i.id)
+      .join(", ")} before retrying.`;
+    console.warn(`[pi-file-tools] ${message}`);
+    return message;
+  };
   if (typeof pi.on === "function")
     pi.on("session_start", async (_event, ctx) => {
-      await managed.maintain("pi-session");
+      // A failed first sweep must not prevent later retries or tool availability.
       if (sweepTimer === undefined) {
         sweepTimer = setInterval(
           () => {
             void managed
               .maintain("pi-session")
+              .then(reportMaintenance)
               .catch((error) =>
                 console.error(
                   `[pi-file-tools] managed sweep failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -112,11 +125,19 @@ export function registerFileTools(
         );
         sweepTimer.unref?.();
       }
-      if (ctx.hasUI)
-        ctx.ui.notify(
-          `Managed backup/temp sweep ready at ${managed.root}`,
-          "info",
-        );
+      try {
+        const result = await managed.maintain("pi-session");
+        const warning = reportMaintenance(result);
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            warning ?? `Managed backup/temp sweep ready at ${managed.root}`,
+            warning ? "warning" : "info",
+          );
+      } catch (error) {
+        const message = `Managed maintenance failed; inspect recorded state before retrying: ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`[pi-file-tools] ${message}`);
+        if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      }
     });
   if (typeof pi.on === "function")
     pi.on("session_shutdown", () => {

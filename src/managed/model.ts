@@ -65,6 +65,9 @@ export interface Item {
   trashId?: string;
   recycledAt?: number;
   error?: string;
+  inspectionError?: string;
+  lastVerifiedAt?: number;
+  linkCount?: number;
 }
 export interface StoreState {
   version: 1;
@@ -136,6 +139,7 @@ export interface Plan {
   recycledBytes: number;
   overBudget: boolean;
   blocked: string[];
+  usage: { complete: boolean; unknownItemIds: string[] };
 }
 function sumBytes(items: Item[]): number {
   const total = items.reduce((sum, item) => sum + BigInt(item.bytes), 0n);
@@ -155,17 +159,28 @@ export function planCleanup(
   const active = items
     .filter((i) => i.state === "active")
     .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
-  let activeBytes = sumBytes(active);
+  const unknownItemIds = active
+    .filter((i) => i.inspectionError !== undefined)
+    .map((i) => i.id);
+  const complete = unknownItemIds.length === 0;
+  let activeBytes = sumBytes(
+    active.filter((i) => i.inspectionError === undefined),
+  );
   let count = active.length;
   const recycle: Plan["recycle"] = [];
   const blocked: string[] = [];
   for (const item of active) {
-    if (item.pinned || item.leaseUntil > now) {
+    if (
+      item.inspectionError !== undefined ||
+      item.pinned ||
+      item.leaseUntil > now
+    ) {
       blocked.push(item.id);
       continue;
     }
     const expired = item.expiresAt <= now;
-    const overflow = count > policy.maxItems || activeBytes > policy.maxBytes;
+    const overflow =
+      count > policy.maxItems || (complete && activeBytes > policy.maxBytes);
     if (expired || overflow) {
       recycle.push({
         id: item.id,
@@ -201,7 +216,9 @@ export function planCleanup(
     activeBytes,
     recycledBytes,
     blocked,
+    usage: { complete, unknownItemIds },
     overBudget:
+      !complete ||
       activeBytes > policy.maxBytes ||
       count > policy.maxItems ||
       recycledBytes > policy.maxRecycledBytes,

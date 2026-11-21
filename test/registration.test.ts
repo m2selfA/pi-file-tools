@@ -8,6 +8,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { registerFileTools } from "../src/index.js";
+import { ManagedStore } from "../src/managed/store.js";
 import { fixture } from "./support.js";
 
 function registrationApi(
@@ -96,6 +97,121 @@ test("session start schedules maintenance and shutdown clears it", async (t) => 
   } finally {
     globalThis.setInterval = originalSetInterval;
     globalThis.clearInterval = originalClearInterval;
+  }
+});
+
+test("failed first maintenance still schedules a retry and shutdown cleanup", async (t) => {
+  const { root, backend } = await fixture(t);
+  const handlers = new Map<string, unknown>();
+  const original = {
+    maintain: ManagedStore.prototype.maintain,
+    set: globalThis.setInterval,
+    clear: globalThis.clearInterval,
+    error: console.error,
+  };
+  let scheduled = 0;
+  let cleared = 0;
+  let attempts = 0;
+  let callback: (() => void) | undefined;
+  const messages: string[] = [];
+  const notifications: { message: string; kind: string }[] = [];
+  globalThis.setInterval = ((fn: () => void) => {
+    scheduled++;
+    callback = fn;
+    return { unref() {} } as ReturnType<typeof setInterval>;
+  }) as typeof setInterval;
+  globalThis.clearInterval = (() => {
+    cleared++;
+  }) as typeof clearInterval;
+  console.error = (...args: unknown[]) => {
+    messages.push(args.join(" "));
+  };
+  ManagedStore.prototype.maintain = async () => {
+    attempts++;
+    if (attempts === 1) throw new Error("injected first sweep failure");
+    return { failed: [], status: "ok" };
+  };
+  try {
+    registerFileTools(registrationApi([], handlers), backend, {
+      root: path.join(root, "managed"),
+    });
+    const start = handlers.get("session_start") as (
+      e: unknown,
+      c: unknown,
+    ) => Promise<void>;
+    await start(
+      {},
+      {
+        hasUI: true,
+        ui: {
+          notify: (message: string, kind: string) =>
+            notifications.push({ message, kind }),
+        },
+      },
+    );
+    assert.equal(scheduled, 1);
+    assert.equal(attempts, 1);
+    assert.ok(messages.some((s) => s.includes("injected first sweep failure")));
+    assert.equal(notifications[0].kind, "warning");
+    assert.ok(callback);
+    callback();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(attempts, 2);
+    (handlers.get("session_shutdown") as () => void)();
+    assert.equal(cleared, 1);
+  } finally {
+    ManagedStore.prototype.maintain = original.maintain;
+    globalThis.setInterval = original.set;
+    globalThis.clearInterval = original.clear;
+    console.error = original.error;
+  }
+});
+
+test("partial startup maintenance is a warning rather than a ready notification", async (t) => {
+  const { root, backend } = await fixture(t);
+  const handlers = new Map<string, unknown>();
+  const original = {
+    maintain: ManagedStore.prototype.maintain,
+    set: globalThis.setInterval,
+    clear: globalThis.clearInterval,
+    warn: console.warn,
+  };
+  const notifications: string[] = [];
+  const warnings: string[] = [];
+  globalThis.setInterval = (() => ({
+    unref() {},
+  })) as unknown as typeof setInterval;
+  globalThis.clearInterval = (() => {}) as typeof clearInterval;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.join(" "));
+  };
+  ManagedStore.prototype.maintain = async () => ({
+    status: "partial",
+    failed: [{ id: "fixture-blocked", error: "inspection failed" }],
+  });
+  try {
+    registerFileTools(registrationApi([], handlers), backend, {
+      root: path.join(root, "managed"),
+    });
+    await (
+      handlers.get("session_start") as (e: unknown, c: unknown) => Promise<void>
+    )(
+      {},
+      {
+        hasUI: true,
+        ui: {
+          notify: (_message: string, kind: string) => notifications.push(kind),
+        },
+      },
+    );
+    assert.deepEqual(notifications, ["warning"]);
+    assert.ok(warnings.some((s) => s.includes("fixture-blocked")));
+    (handlers.get("session_shutdown") as () => void)();
+  } finally {
+    ManagedStore.prototype.maintain = original.maintain;
+    globalThis.setInterval = original.set;
+    globalThis.clearInterval = original.clear;
+    console.warn = original.warn;
   }
 });
 

@@ -50,7 +50,7 @@ import {
   resolveStorageRoot,
   savePolicy,
 } from "./settings.js";
-import { copyTree, inspectTree, noLinks } from "./tree.js";
+import { copyTree, inspectTree, noLinks, type Tree } from "./tree.js";
 
 export interface ManagedInput {
   action:
@@ -285,6 +285,15 @@ export class ManagedStore {
         typeof item.project !== "string"
       )
         throw new Error("Invalid managed item metadata; refusing maintenance.");
+      if (
+        (item.inspectionError !== undefined &&
+          typeof item.inspectionError !== "string") ||
+        (item.lastVerifiedAt !== undefined &&
+          !Number.isFinite(item.lastVerifiedAt)) ||
+        (item.linkCount !== undefined &&
+          (!Number.isSafeInteger(item.linkCount) || item.linkCount < 0))
+      )
+        throw new Error("Invalid inspection health metadata.");
       ids.add(item.id);
       registered.add(`${item.category}/${item.id}`);
       const expected = path.join(this.root, item.category, item.id, item.name);
@@ -315,24 +324,80 @@ export class ManagedStore {
             `Unregistered managed directory ${name}; preserve and reconcile it before maintenance.`,
           );
   }
-  private async refresh(state: StoreState, owner?: string): Promise<void> {
-    const now = this.now();
-    for (const item of state.items.filter((i) => i.state === "active")) {
+  private async inspectItem(item: Item, signal?: AbortSignal): Promise<Tree> {
+    try {
       await noLinks(item.path);
-      const tree = await inspectTree(item.path);
+      const tree = await inspectTree(
+        item.path,
+        MANAGED_LIMITS.maxBytes,
+        signal,
+        item.category === "temp" ? "opaque" : "reject",
+      );
       if (item.category === "backup" && tree.digest !== item.digest)
         throw new Error(
           `Backup integrity check failed: ${item.id}; no cleanup performed.`,
         );
       item.bytes = tree.bytes;
-      if (
-        item.category === "temp" &&
-        owner &&
-        item.owner === owner &&
-        item.leaseUntil > now
-      )
-        item.leaseUntil = now + LEASE_MS;
+      item.linkCount = tree.linkCount;
+      item.lastVerifiedAt = this.now();
+      delete item.inspectionError;
+      return tree;
+    } catch (error) {
+      checkAbort(signal);
+      item.inspectionError = errorMessage(error).slice(0, 2000);
+      throw error;
     }
+  }
+  private async refresh(
+    state: StoreState,
+    category: Category,
+    owner?: string,
+    signal?: AbortSignal,
+  ): Promise<{ id: string; error: string }[]> {
+    const failed: { id: string; error: string }[] = [];
+    const now = this.now();
+    for (const item of state.items.filter(
+      (i) => i.state === "active" && i.category === category,
+    )) {
+      try {
+        await this.inspectItem(item, signal);
+        if (
+          item.category === "temp" &&
+          owner &&
+          item.owner === owner &&
+          item.leaseUntil > now
+        )
+          item.leaseUntil = now + LEASE_MS;
+      } catch (error) {
+        checkAbort(signal);
+        failed.push({ id: item.id, error: errorMessage(error) });
+      }
+    }
+    return failed;
+  }
+  private async copyOut(
+    item: Item,
+    tree: Tree,
+    destination: string,
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const links = item.category === "temp" ? "opaque" : "reject";
+    await this.files.transfer(
+      "copy",
+      { source: item.path, destination, recursive: tree.kind === "directory" },
+      cwd,
+      signal,
+      (source, target, _recursive, copySignal) =>
+        copyTree(source, target, tree, copySignal, links),
+    );
+    if (
+      (await inspectTree(destination, MANAGED_LIMITS.maxBytes, signal, links))
+        .digest !== tree.digest
+    )
+      throw new Error(
+        `Restore verification failed; preserve destination ${destination}.`,
+      );
   }
   private allowed(category: Category, input: NormalizedInput): void {
     const fields: Record<ManagedInput["action"], string[]> = {
@@ -382,8 +447,7 @@ export class ManagedStore {
     item: Item,
     save: () => Promise<void>,
   ): Promise<void> {
-    await noLinks(item.path);
-    await inspectTree(item.path);
+    await this.inspectItem(item);
     item.state = "recycling";
     await save();
     try {
@@ -408,11 +472,12 @@ export class ManagedStore {
     state: StoreState,
     category: Category,
     save: () => Promise<void>,
+    inspectionFailures: { id: string; error: string }[] = [],
   ): Promise<OperationResult> {
     const plan = planCleanup(state, category, this.now());
     const released: string[] = [];
     const purged: string[] = [];
-    const failed: { id: string; error: string }[] = [];
+    const failed: { id: string; error: string }[] = [...inspectionFailures];
     // Validate every selected OS id against its original registered path before any purge.
     const bin = plan.purge.length ? await this.trash.list() : [];
     for (const row of plan.purge) {
@@ -430,7 +495,8 @@ export class ManagedStore {
         released.push(item.id);
       } catch (error) {
         failed.push({ id: item.id, error: errorMessage(error) });
-        break;
+        if (item.state !== "active") break;
+        await save();
       }
     }
     for (const row of plan.purge) {
@@ -457,6 +523,7 @@ export class ManagedStore {
     }
     return {
       plan,
+      status: failed.length ? "partial" : "ok",
       released,
       purged,
       failed,
@@ -473,13 +540,29 @@ export class ManagedStore {
         throw new Error(
           `Unresolved managed operations: ${unresolved.map((i) => i.id).join(", ")}; preserve evidence and inspect before maintenance.`,
         );
-      await this.refresh(state, owner);
+      const backupFailures = await this.refresh(state, "backup", owner);
+      const tempFailures = await this.refresh(state, "temp", owner);
       await save();
-      const backup = await this.applyCleanup(state, "backup", save);
-      const temp = await this.applyCleanup(state, "temp", save);
+      const backup = await this.applyCleanup(
+        state,
+        "backup",
+        save,
+        backupFailures,
+      );
+      const temp = await this.applyCleanup(state, "temp", save, tempFailures);
       state.lastSweep = this.now();
       await save();
-      return { root: this.root, backup, temp };
+      const failed = [
+        ...(backup.failed as unknown[]),
+        ...(temp.failed as unknown[]),
+      ];
+      return {
+        root: this.root,
+        status: failed.length ? "partial" : "ok",
+        failed,
+        backup,
+        temp,
+      };
     }, false);
     return result ?? { root: this.root, initialized: false };
   }
@@ -567,21 +650,32 @@ export class ManagedStore {
         throw new Error(
           "Unresolved managed operation blocks mutation. Use list/inspect; do not reset the registry.",
         );
-      await this.refresh(state);
       checkAbort(signal);
       if (input.action === "cleanup") {
+        const failures = await this.refresh(state, category, undefined, signal);
         const plan = planCleanup(state, category, this.now());
-        if (!input.execute) return { root: this.root, plan, applied: false };
+        if (!input.execute)
+          return {
+            root: this.root,
+            plan,
+            applied: false,
+            failed: failures,
+            status: failures.length ? "partial" : "ok",
+          };
+        await save();
         return {
           root: this.root,
           applied: true,
-          ...(await this.applyCleanup(state, category, save)),
+          ...(await this.applyCleanup(state, category, save, failures)),
         };
       }
       if (input.action === "touch") {
         const item = this.find(state, category, input.id);
         if (item.state !== "active")
           throw new Error("Only active items may be renewed.");
+        await noLinks(item.path);
+        if (!(await exists(item.path)))
+          throw new Error("Cannot renew a missing managed item.");
         item.expiresAt =
           this.now() +
           (input.ttlHours ?? state.policies[category].ttlHours) * 3600000;
@@ -597,6 +691,18 @@ export class ManagedStore {
         if (item.state !== "active")
           throw new Error("Only active items may be released.");
         if (item.pinned) throw new Error("Unpin the item before releasing it.");
+        try {
+          await this.inspectItem(item, signal);
+        } catch (error) {
+          checkAbort(signal);
+          await save();
+          return {
+            item,
+            applied: false,
+            status: "blocked",
+            failed: [{ id: item.id, error: errorMessage(error) }],
+          };
+        }
         if (!input.execute)
           return { item, applied: false, destination: "OS recycle bin" };
         checkAbort(signal);
@@ -617,28 +723,25 @@ export class ManagedStore {
             "Restore destination already exists; choose another path.",
           );
         if (item.state === "active") {
-          const tree = await inspectTree(item.path);
-          if (category === "backup" && tree.digest !== item.digest)
-            throw new Error("Backup digest mismatch.");
-          await this.files.transfer(
-            "copy",
-            {
-              source: item.path,
-              destination,
-              recursive: tree.kind === "directory",
-            },
-            cwd,
-            signal,
-          );
-          const restored = await inspectTree(destination);
-          if (restored.digest !== tree.digest)
-            throw new Error(
-              `Restore verification failed; preserve destination ${destination}.`,
-            );
+          let tree: Tree;
+          try {
+            tree = await this.inspectItem(item, signal);
+          } catch (error) {
+            checkAbort(signal);
+            await save();
+            return {
+              item,
+              applied: false,
+              status: "blocked",
+              failed: [{ id: item.id, error: errorMessage(error) }],
+            };
+          }
+          await this.copyOut(item, tree, destination, cwd, signal);
+          await save();
           return {
             item,
             destination,
-            verifiedDigest: restored.digest,
+            verifiedDigest: tree.digest,
             consumed: false,
           };
         }
@@ -650,32 +753,42 @@ export class ManagedStore {
         // Recover into the registered path first, never trust unchecked OS-bin contents as a backup.
         item.state = "creating";
         await save();
-        await this.trash.restore(item.trashId as string, item.path);
-        const tree = await inspectTree(item.path);
-        if (category === "backup" && tree.digest !== item.digest) {
-          item.state = "failed";
-          item.error = "Recovered backup digest mismatch; payload preserved.";
-          await save();
-          throw new Error(item.error);
-        }
+        const recovery = await this.trash.restore(
+          item.trashId as string,
+          item.path,
+        );
+        if (
+          pathKey(recovery.destination) !== pathKey(item.path) ||
+          !(await exists(item.path))
+        )
+          throw new Error(
+            "Restore outcome differs from its registered path; inspect source and OS bin before retry.",
+          );
         item.state = "active";
         delete item.trashId;
         delete item.recycledAt;
         item.expiresAt =
           this.now() + state.policies[category].ttlHours * 3600000;
+        item.inspectionError = "Recovered item awaits inspection.";
         await save();
-        await this.files.transfer(
-          "copy",
-          {
-            source: item.path,
-            destination,
-            recursive: tree.kind === "directory",
-          },
-          cwd,
-          signal,
-        );
-        if ((await inspectTree(destination)).digest !== tree.digest)
-          throw new Error("Restored copy digest mismatch; preserve evidence.");
+        let tree: Tree;
+        try {
+          tree = await this.inspectItem(item, signal);
+        } catch (error) {
+          checkAbort(signal);
+          await save();
+          return {
+            item,
+            applied: false,
+            recoveredToManagedPath: true,
+            recoveredPath: item.path,
+            destinationRequested: destination,
+            status: "blocked",
+            failed: [{ id: item.id, error: errorMessage(error) }],
+          };
+        }
+        await save();
+        await this.copyOut(item, tree, destination, cwd, signal);
         return {
           item,
           destination,
@@ -723,6 +836,13 @@ export class ManagedStore {
       const policy = state.policies[category];
       if (bytes > policy.maxBytes)
         throw new Error("New item exceeds managed byte quota.");
+      const failures = await this.refresh(state, category, undefined, signal);
+      if (failures.length) {
+        await save();
+        throw new Error(
+          `Cannot admit ${category}: unverified usage for ${failures.map((i) => i.id).join(", ")}. Inspect those items; unknown bytes are not zero.`,
+        );
+      }
       const id = `${category}-${randomUUID()}`;
       const item: Item = {
         id,

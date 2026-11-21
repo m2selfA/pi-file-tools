@@ -120,6 +120,20 @@ pi install .
 
 两个工具都支持 `create`、`list`、`inspect`、`restore`、`release`、`cleanup`、`policy`、`pin`、`touch`。`cleanup` 默认只返回计划，必须显式 `execute:true` 才会操作。临时项创建后有 15 分钟租约，`touch` 可续租；`pinned:true` 项不会自动释放。
 
+### 链接目录与部分维护
+
+从符号链接或 junction 工作目录运行是允许的。受管存储根、类别目录和每个条目的根仍禁止被链接重定向，插件保留项目逻辑路径，不修改进程的 cwd。
+
+`temp` 内部的链接作为叶子登记，不遍历目标，也不把目标文件计入容量。链接自身的元数据字节会计入条目。目录内的断链和循环链接不会触发目标递归。`backup` 继续严格拒绝源树中的链接和特殊条目。
+
+临时项恢复会重建链接而非物化目标内容。Windows 使用只读 reparse 信息区分 junction、文件符号链接与目录符号链接，保留其类型和原始目标字符串；权限不足或不支持的类型会明确失败，不降级为普通文件或目录。相对目标原样保留，因此它相对于新的恢复位置解析；不会被悄悄改成绝对目标。
+
+扫描异常记录在 `inspectionError`，不将条目改成全局未决的变更状态。`lastVerifiedAt` 和 `linkCount` 是最近一次成功检查的观测值。维护出现单项异常时返回部分完成及 `failed` 列表，跳过问题项并处理健康项。首次维护异常也不会阻止定时器注册。
+
+`plan.usage.complete: false` 表示部分活跃项用量未验证；此时 `activeBytes` 仅为已知项的规划值，不是完整总量，条目原来的缓存字节不会被置零。相关类别的新分配会明确阻止；健康项的显式恢复、续租和释放不再扫描无关条目。配置/清单损坏或原生变更结果不确定仍会阻止危险操作。
+
+原生恢复已确认到登记路径、但内容检查失败时，会保留中央副本并返回 `recoveredToManagedPath: true` 与受阻状态，不假称已导出到请求目标。原生恢复结果本身未确认时，仍保持未决保护，不能自动重试删除或覆盖。
+
 ### 预先提示（默认开启）
 
 插件通过 `before_agent_start` 在每次 agent 运行开始前添加 `pi_file_tools` 提示段，提醒先用 `temp` 分配临时路径、在重要覆盖或迁移前用 `backup` 建立恢复点。不改写磁盘上的 `AGENTS.md`，也不会在每一轮自动创建临时项或备份。
@@ -225,6 +239,7 @@ npm run test:scale
 npm run test:user-settings
 powershell -NoProfile -File ./scripts/native-audit.ps1
 npm run test:windows
+npm run test:links:windows
 ```
 
 Linux 机器另运行 npm run test:linux。平台专用测试在错误平台会跳过，跳过不构成通过证据。单元测试中的临时 Freedesktop 后端属于逻辑验证，不能替代 Linux 原生结果。

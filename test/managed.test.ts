@@ -246,9 +246,12 @@ test("modified backup is rejected before maintenance", async (t) => {
     path.join((created.item as { path: string }).path),
     "tampered",
   );
-  await assert.rejects(
-    store.execute("backup", { action: "cleanup" }, root),
-    /integrity check failed/,
+  const blocked = await store.execute("backup", { action: "cleanup" }, root);
+  assert.equal(blocked.status, "partial");
+  assert.ok(
+    (blocked.failed as { id: string; error: string }[]).some(
+      (row) => row.id === id && row.error.includes("integrity check failed"),
+    ),
   );
   const inspected = await store.execute(
     "backup",

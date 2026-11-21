@@ -10,6 +10,7 @@
 | `npm run test:host` | Two official Pi-loader rounds with isolated settings and actual tool calls |
 | `npm run test:scale` | 16K historical records and an actual 16K-file directory scan |
 | `npm run test:windows` | Windows native recycle/restore and selected-only cleanup |
+| `npm run test:links:windows` | Deep nested junctions, broken/cyclic links and file/directory symbolic links: recycle/restore/purge with unchanged outside sentinels; missing OS privilege is an explicit skip |
 | `npm run test:linux` | Native Linux integration; skipped on other platforms |
 | `npm run test:user-settings` | Optional read-only loader check when a local settings file exists |
 

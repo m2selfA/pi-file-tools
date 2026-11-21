@@ -82,6 +82,8 @@ async function copyEntry(
   } else throw new Error(`Unsupported special filesystem entry: ${source}`);
 }
 
+export type CopyOperation = typeof copyEntry;
+
 export class FileOperations {
   constructor(
     private readonly trash: TrashBackend,
@@ -112,6 +114,7 @@ export class FileOperations {
     input: TransferInput,
     cwd: string,
     signal?: AbortSignal,
+    copy: CopyOperation = copyEntry,
   ): Promise<OperationResult> {
     const source = resolvePath(input.source, cwd);
     const destination = resolvePath(input.destination, cwd);
@@ -166,7 +169,7 @@ export class FileOperations {
               path.join(path.dirname(destination), ".pi-file-tools-stage-"),
             );
             prepared = path.join(staging, "payload");
-            await copyEntry(source, prepared, !!input.recursive, signal);
+            await copy(source, prepared, !!input.recursive, signal);
           }
           checkAbort(signal);
           if (destinationExists) saved = await this.trash.put(destination);

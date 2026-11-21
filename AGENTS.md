@@ -9,7 +9,7 @@ A TypeScript ESM Pi extension providing `mkdir`, `copy`, `rename`, `trash`, `bac
 - `npm run test:host` checks the official Pi loader with an isolated config/store.
 - `npm run test:scale` exercises 16K historical records and a real 16K-file scan.
 - `npm run test:user-settings` only loads actual user settings; it emits no maintenance event.
-- Windows: `powershell -NoProfile -File ./scripts/native-audit.ps1` and `npm run test:windows`.
+- Windows: `powershell -NoProfile -File ./scripts/native-audit.ps1`, `npm run test:windows` and `npm run test:links:windows`.
 - Linux: `npm run test:linux`; a Windows-host skip is not Linux verification.
 
 ## Structure and safety
