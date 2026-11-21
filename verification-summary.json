@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "0.2.1",
+  "status": "passed-with-platform-gaps",
+  "verifiedAtUtc": "2026-11-21T14:13:46.921Z",
+  "sourceInputDigest": "c0939463a7b7beddae91abe26cda9158001e731ca1756c081005fba83c1ce2b7",
+  "hashScope": "Files selected by scripts/source-state.ts; not a Git commit, binary or memory-image hash.",
+  "environment": {
+    "platform": "win32",
+    "node": "v24.15.0",
+    "piHost": "1.6.0"
+  },
+  "results": {
+    "unit": {
+      "passed": 60,
+      "failed": 0
+    },
+    "officialLoader": {
+      "rounds": 2,
+      "tools": 6
+    },
+    "scale": {
+      "passed": 2,
+      "historicalRecords": 16384,
+      "actualFiles": 16384,
+      "treeEntries": 16386
+    },
+    "nativeApi": {
+      "callbackChecks": 4
+    },
+    "windowsNative": {
+      "checks": 10,
+      "originalRecycleBinItemsPreserved": true
+    },
+    "actualSettingsLoader": {
+      "passed": true,
+      "userStoreOperations": 0
+    },
+    "linuxNative": {
+      "status": "skipped-on-windows",
+      "nativeHostVerified": false
+    }
+  },
+  "rawEvidence": {
+    "published": false,
+    "reason": "Local receipts include machine paths, OS item IDs and unrelated workspace metadata; originals are preserved privately."
+  },
+  "limitations": [
+    "No independent advisor approval is claimed.",
+    "Long real-time expiry and recycle retention were not waited out.",
+    "Validation maxima do not establish maximum-capacity throughput.",
+    "Linux native integration requires a Linux host."
+  ]
+}

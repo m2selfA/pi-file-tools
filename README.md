@@ -1,0 +1,221 @@
+# pi-file-tools
+
+为 Pi Coding Agent 提供 `mkdir`、`copy`、`rename`、`trash`、`backup`、`temp`。支持 Windows 和 Linux，不注册 `delete`。
+
+参考 ryan-griffin/pi-file-tools 的工具行为，独立实现。来源和版本见 [PROVENANCE.md](PROVENANCE.md)。不启动额外服务，不依赖外部 MCP。
+
+## 安装
+
+从 GitHub 安装到 Pi：
+
+```powershell
+pi install git:github.com/m2selfA/pi-file-tools
+```
+
+随后在 Pi 中执行 `/reload`。
+
+## 本地开发
+
+开发环境 Node.js >=22.19，验证使用 Pi 1.6.0。
+
+```powershell
+git clone https://github.com/m2selfA/pi-file-tools.git
+cd pi-file-tools
+npm ci --ignore-scripts
+pi -e ./src/index.ts
+```
+
+持久安装到 Pi（需要时执行）：
+
+```powershell
+pi install .
+```
+
+随后在 Pi 中 `/reload`。本地路径包不会由 Pi 自动安装其依赖，因此首次使用本地包应先运行 npm ci。宿主提供的包只声明为 peerDependencies，开发副本用于测试。加载前应避免同时启用其他注册同名 `copy / rename / mkdir / trash / backup / temp` 的扩展。
+
+## 工具
+
+| 工具 | 行为 |
+|---|---|
+| `mkdir` | 创建空目录；默认递归创建父目录；已存在时返回 created:false |
+| `copy` | 复制到精确目标路径；目录需 recursive:true；不自动创建父目录 |
+| `rename` | 移动到精确目标路径；不自动创建父目录；拒绝跨卷移动 |
+| `trash` | put 移入系统回收站；list 分页列出；restore 恢复；empty 永久清理回收站条目 |
+| `backup` | 将文件或目录复制到 Pi agent 集中存储；SHA-256 校验；预览/执行清理；恢复和释放 |
+| `temp` | 在 Pi agent 集中存储创建临时文件或目录；租约、固定保留、预览/执行清理和释放 |
+
+路径支持绝对路径、相对当前 cwd 的路径及开头的 `@` 标记。Windows 支持正反斜杠、空格和中文；拒绝 ADS、设备路径、盘符相对路径、保留设备名以及结尾点/空格别名。
+
+### 创建目录
+
+```json
+{"path":"work/中文目录","recursive":true}
+```
+
+### 复制与重命名
+
+```json
+{"source":"a.txt","destination":"backup/a.txt"}
+```
+
+```json
+{"source":"src","destination":"backup/src","recursive":true}
+```
+
+`overwrite` 默认 false。显式设为 true 时，旧目标先移入 OS 回收站，结果中 `replacedItem.id` 可用于恢复。新目标提交失败时尝试恢复旧目标；恢复失败会保留条目并在错误中给出 ID。不能以文件替换目录，或反过来。
+
+### 移入回收站
+
+调用 `trash`：
+
+```json
+{"action":"put","path":"work/old.txt"}
+```
+
+非空目录需要显式授权递归：
+
+```json
+{"action":"put","path":"work/old-folder","recursive":true}
+```
+
+返回 `item.id`、`originalPath`、完整文件名、删除时间及类型。移入失败不会改用永久删除。文件系统根、用户主目录、当前工作目录以及包含它们的真实目录受保护。
+
+### 列出与恢复
+
+```json
+{"action":"list","offset":0,"limit":100}
+```
+
+返回 total、items、nextOffset；limit 为 1..200。Windows 列出当前用户系统回收站中的所有条目，包含非本插件产生的条目。ID 为不透明标识，必须原样使用。
+
+```json
+{"action":"restore","id":"<put 或 list 返回的精确 ID>"}
+```
+
+```json
+{"action":"restore","id":"<精确 ID>","destination":"recovered/old.txt"}
+```
+
+默认恢复到原路径；目标已存在时拒绝覆盖。父目录必须存在。Windows Shell 极窄并发碰撞会选择不覆盖的替代名字，实际路径通过 destination 返回。
+
+### 清空
+
+只永久清理指定条目：
+
+```json
+{"action":"empty","ids":["<精确 ID>"],"confirm":"EMPTY"}
+```
+
+清空枚举时快照中的整个回收站：
+
+```json
+{"action":"empty","all":true,"confirm":"EMPTY"}
+```
+
+**empty 不可恢复。** ids 与 all:true 二选一；不提供范围或确认字符串时拒绝。单次最多 256 项。全量范围超过上限时应分批指定 ID。返回 removed 和 failed，部分失败在 Pi 中明确标记为错误；不会伪装成全部成功。all:true 会影响用户原有条目，只有明确要清空整个系统回收站时才使用。
+
+## 集中备份和临时文件
+
+`backup` 和 `temp` 使用同一个受管存储根目录，默认位于 Pi agent 数据目录下的 `file-tools`。在 Pi agent 目录下的 `file-tools.json` 设置 `storageRoot` 可更改位置，支持绝对路径、`~`、`~/…` 和 `~\…`。环境变量 `PI_FILE_TOOLS_HOME` 优先于文件设置。存储根包含原子 `state.json`、用途和项目元数据、SHA-256 摘要，以及 `backup` 和 `temp` 两个类别目录。首次接管非空目录会拒绝，避免覆盖未知文件。
+
+两个工具都支持 `create`、`list`、`inspect`、`restore`、`release`、`cleanup`、`policy`、`pin`、`touch`。`cleanup` 默认只返回计划，必须显式 `execute:true` 才会操作。临时项创建后有 15 分钟租约，`touch` 可续租；`pinned:true` 项不会自动释放。
+
+### 设置文件
+
+默认读取 `~/.pi/agent/file-tools.json`（自定义 `PI_CODING_AGENT_DIR` 时跟随 agent 目录）。随包提供 [file-tools.example.json](./file-tools.example.json)，可复制后编辑；不把用户配置放进数据目录。`PI_FILE_TOOLS_CONFIG` 可指定其他设置文件，路径同样支持 `~`。
+
+```json
+{
+  "version": 1,
+  "storageRoot": "~/.pi/agent/file-tools",
+  "policies": {
+    "backup": {
+      "ttlHours": "30d",
+      "maxItems": 50,
+      "maxBytes": "5G",
+      "purgeAfterHours": "7d",
+      "maxRecycledBytes": "1G"
+    },
+    "temp": {
+      "ttlHours": "24h",
+      "maxItems": 100,
+      "maxBytes": "2G",
+      "purgeAfterHours": "7d",
+      "maxRecycledBytes": "1G"
+    }
+  }
+}
+```
+
+- `ttlHours`：新建或 `touch` 时使用的默认 TTL，单位小时；不改写已有条目的 `expiresAt`，单项 `ttlHours` 参数仍可覆盖。
+- `maxItems`：活跃条目数量上限，正整数，最大 65536（`"64k"`）；`"16k"` 等于 16384。
+- `maxBytes`：活跃容量上限，单位字节，最大 1 PiB（`"1P"`）；例如 `"2G"` 或 `"1.5GiB"`。
+- `purgeAfterHours`：移入回收站后的最短保留时间；和 TTL 一样接受 1–876000 小时，或 `"7d"`、`"100y"` 等时长。
+- `maxRecycledBytes`：受管回收条目的容量预算，最大 1 PiB；接受 `"1G"` 等写法。超预算也不会提前缩短回收站保留期，必要时阻止继续分配。
+
+数量和容量的 `k/K`、`m/M`、`g/G`、`t/T`、`p/P` 均按 1024 的幂换算；容量也接受 KB、KiB、MB、MiB 等别名，**这里 KB/MB/GB 同样按二进制解释**。无后缀字符串与普通数字含义相同。含单位的值在 JSON 中必须加引号。数量和字节最终必须是精确整数：`"1.5G"` 合法，`"0.1k"` 不会被静默取整。
+
+时长的无后缀值以小时计，支持 `h/d/w/y`（一年按 365 天）、`min`、`s`；最终仍需处于 1 小时至 100 年范围。时长不使用 `m/M` 缩写，请用 `min` 表示分钟。Pi 工具的 `policy` 和单项 `ttlHours` 也使用同一解析规则。保存策略时保留用户填写的单位写法，不把其他类别的可读字符串强制改成数字。
+
+字段可以只填一部分：文件中显式字段优先于该存储已有的策略，其余保留原值；新存储缺失字段使用内置默认。未知字段、负值或无效 JSON 会报错并停止维护，不静默使用默认清理策略。
+
+策略文件在每次工具调用或维护前读取；`policy` 的预览不会改文件，`execute:true` 会在锁内原子保存到设置文件，重新加载后仍有效。多个会话更新不同类别不会覆盖对方的设置。设置文件写入失败时会报错并保留原文件。
+
+修改 `storageRoot` 后需要重新加载 Pi 扩展；不会自动迁移或删除旧目录。环境变量路径覆盖同样在扩展重新加载时生效。Pi 关闭期间没有额外服务代为维护。
+
+默认策略如下。
+
+| 类别 | 过期时间 | 活跃数量 | 活跃容量 | 回收站保留期 |
+|---|---:|---:|---:|---:|
+| `backup` | 30 天 | 50 | 5 GiB | 7 天 |
+| `temp` | 24 小时 | 100 | 2 GiB | 7 天 |
+
+超出数量或活跃容量时，最旧且未固定、未租约保护的项进入清理计划。执行清理先移入操作系统回收站，记录 `trashId`，经过 `purgeAfterHours` 后才允许 `cleanup` 永久清理本工具自己的条目。`physicalBytesFreed` 在永久清理前返回 `null`，不会把移入回收站误报成已释放磁盘空间。
+
+备份从源文件或目录创建快照，拒绝符号链接、junction 和特殊文件，单个目录树最多 100000 个文件/目录条目，容量受策略限制。受管清单最多 262144 条记录、256 MiB；超出字节预算时会在替换原清单之前拒绝写入。上述是校验边界，不承诺在全部上限处的吞吐量或可用磁盘空间。创建和恢复都会校验摘要，源或快照在扫描过程中变化会失败并保留失败记录。恢复不会覆盖现有目标。
+
+示例：
+
+```json
+{"action":"create","path":"src","purpose":"before migration"}
+```
+
+```json
+{"action":"create","kind":"file","name":"scratch.json","content":"{}","purpose":"temporary model output"}
+```
+
+```json
+{"action":"cleanup"}
+```
+
+```json
+{"action":"cleanup","execute":true}
+```
+
+扩展在 `session_start` 执行一次离线维护，并在会话期间每 15 分钟执行一次可取消的 sweep；`session_shutdown` 会注销定时器。Pi 关闭期间不运行常驻服务。
+
+## 平台实现与边界
+
+- **Windows**：使用自带 Windows PowerShell 5.1，按需启动一个短命 STA 子进程，通过 IFileOperation 操作真实系统回收站。C# 源码随包分发，Add-Type 在内存中编译；无二进制下载、后台服务或提权。put 使用回收标志和删除前回调；不允许转为永久删除。恢复使用 System.FileName 而非可能隐藏扩展名的显示名。只接受本地盘符绝对路径进行回收，拒绝 UNC/网络路径。
+- **Linux**：使用 Freedesktop home trash（$XDG_DATA_HOME/Trash，默认 ~/.local/share/Trash），要求当前用户所有权和私有目录权限，保存标准 .trashinfo。仅支持同文件系统；其他设备的 put 拒绝执行，不会复制后删除。move 使用 /usr/bin/mv 的 no-clobber 模式；需要 GNU coreutils。暂不枚举其他挂载点的 .Trash-*。
+- **macOS**：当前不支持，明确报错。
+- copy 保留链接而非递归跟随；Windows 目录链接按 junction 复制，文件 symlink 创建仍受系统权限限制；不承诺 ACL、所有扩展属性或特殊文件等价复制。
+- 锁与 Pi 的 withFileMutationQueue 协调进程内文件变更。不是对外部不受信进程的文件系统沙箱；调用期间外部移动目录、替换挂载点仍可能使操作失败。
+- 原生调用开始前检查取消；开始后等待 OS 操作结束以保留可靠结果。Helper 有 120 秒超时及 8 MiB 输出上限；超时/通信错误视为结果不确定，先读取源路径和回收站再重试。
+- 不需要管理员权限；不修改 Defender 或执行策略。系统回收站不可用、容量不足、权限不足、脚本被策略阻止时返回错误。受管工具的策略保存行为见上方“设置文件”。
+
+## 验证
+
+```powershell
+npm run verify
+npm run test:host
+npm run test:scale
+# 可选：已有本地 file-tools.json 时，只读加载当前设置
+npm run test:user-settings
+powershell -NoProfile -File ./scripts/native-audit.ps1
+npm run test:windows
+```
+
+Linux 机器另运行 npm run test:linux。平台专用测试在错误平台会跳过，跳过不构成通过证据。单元测试中的临时 Freedesktop 后端属于逻辑验证，不能替代 Linux 原生结果。
+
+Windows 测试只永久清理新建测试根中的条目，验证原有系统回收站 ID 和数量保持不变。不会测试清空用户整个系统回收站。验证范围见 [VERIFICATION.md](VERIFICATION.md)。原始运行日志保存在本机的 `verification/`，不随公开仓库分发。

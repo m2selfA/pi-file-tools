@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "storageRoot": "~/.pi/agent/file-tools",
+  "policies": {
+    "backup": {
+      "ttlHours": "30d",
+      "maxItems": 50,
+      "maxBytes": "5G",
+      "purgeAfterHours": "7d",
+      "maxRecycledBytes": "1G"
+    },
+    "temp": {
+      "ttlHours": "24h",
+      "maxItems": 100,
+      "maxBytes": "2G",
+      "purgeAfterHours": "7d",
+      "maxRecycledBytes": "1G"
+    }
+  }
+}

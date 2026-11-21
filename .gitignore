@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+*.tgz
+.verification-tmp/
+/file-tools.json
+# Raw local validation archives may contain environment-specific data.
+/verification/

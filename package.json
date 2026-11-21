@@ -1,0 +1,72 @@
+{
+  "name": "@m2selfa/pi-file-tools",
+  "version": "0.2.1",
+  "description": "Pi file tools with Windows/Linux trash, centralized backups and temporary resources",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "filesystem",
+    "recycle-bin",
+    "windows"
+  ],
+  "os": [
+    "win32",
+    "linux"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/",
+    "file-tools.example.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "PROVENANCE.md",
+    "VERIFICATION.md",
+    "verification-summary.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check": "biome check .",
+    "format": "biome check --write .",
+    "test": "tsx --test test/*.test.ts",
+    "test:windows": "tsx --test test/windows.integration.ts",
+    "test:linux": "tsx --test test/linux.integration.ts",
+    "test:host": "tsx scripts/host-smoke.ts",
+    "test:scale": "tsx --test test/managed-scale.integration.ts",
+    "test:user-settings": "tsx scripts/user-settings-smoke.ts",
+    "verify": "npm run typecheck && npm run check && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.6.0",
+    "typebox": "1.3.27",
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3",
+    "tsx": "^4.20.6",
+    "@biomejs/biome": "^2.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/m2selfA/pi-file-tools.git"
+  },
+  "homepage": "https://github.com/m2selfA/pi-file-tools",
+  "bugs": {
+    "url": "https://github.com/m2selfA/pi-file-tools/issues"
+  }
+}
