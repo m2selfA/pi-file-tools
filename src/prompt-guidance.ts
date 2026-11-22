@@ -6,6 +6,7 @@ export const PREFLIGHT_MARKER = "PI_FILE_TOOLS_PREFLIGHT";
 export const PREFLIGHT_GUIDANCE = [
   PREFLIGHT_MARKER,
   "Plan scratch outputs and recovery points before the first filesystem write.",
+  "- pi-file-tools operations use only the Pi controller-local filesystem, never an active SSH remote host. Resolve paths locally; if SSH is active, use its ssh_* tools for remote paths and download a remote tree before backing it up.",
   '- Before creating disposable scratch files/directories, one-off probe scripts, intermediate results or throwaway downloads, call temp with action:"create" and write only within the returned path. Do not hand-create scattered tmp folders.',
   '- Before risky overwrites or migrations of valuable existing files/directories, or when creating backup copies, call backup with action:"create" first and retain its recovery ID. Do not hand-roll .bak or backup_old copies.',
   "- Respect user-specified source and final-deliverable destinations; those are not disposable scratch output.",

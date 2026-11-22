@@ -20,6 +20,7 @@ import {
   PREFLIGHT_SECTION,
   type PreflightPromptEvent,
 } from "../src/prompt-guidance.js";
+import { LOCAL_SCOPE } from "../src/scope.js";
 import { sourceState } from "./source-state.js";
 
 const root = path.resolve(import.meta.dirname, "..");
@@ -69,6 +70,21 @@ try {
       "trash",
     ]);
     assert.equal(ours.tools.has("delete"), false);
+    const descriptionsScoped = [...ours.tools].every(([, tool]) =>
+      (tool.definition.description ?? "").includes(LOCAL_SCOPE),
+    );
+    assert.equal(descriptionsScoped, true);
+    const tempRules = ours.tools.get("temp")?.definition.promptGuidelines ?? [];
+    const backupRules =
+      ours.tools.get("backup")?.definition.promptGuidelines ?? [];
+    const tempSshGuidance =
+      tempRules.some((rule) => rule.includes("When an SSH target is active")) &&
+      tempRules.some((rule) => rule.includes("do not pass it to ssh_write"));
+    const backupSshGuidance = backupRules.some((rule) =>
+      rule.includes("never reads through SSH"),
+    );
+    assert.equal(tempSshGuidance, true);
+    assert.equal(backupSshGuidance, true);
     const context = { cwd: agentDir } as ExtensionToolContext;
     const mk = ours.tools.get("mkdir");
     assert.ok(mk);
@@ -265,6 +281,8 @@ try {
       ).split(PREFLIGHT_MARKER).length - 1;
     await hook(promptEvent, context);
     assert.equal(markerCount(), 1);
+    const preflightText = promptOptions.sections?.[PREFLIGHT_SECTION] ?? "";
+    assert.match(preflightText, /controller-local filesystem/);
     await hook(promptEvent, context);
     assert.equal(markerCount(), 1);
     const configFile = process.env.PI_FILE_TOOLS_CONFIG;
@@ -315,6 +333,14 @@ try {
         "trash:list",
         "before_agent_start:preflight:on-off",
       ],
+      scopeVerified: {
+        allSixToolDescriptions: descriptionsScoped,
+        preflightSection: /controller-local filesystem/.test(preflightText),
+        tempSshGuidance,
+        backupSshGuidance,
+        scope:
+          "loaded tool metadata and actual before_agent_start callback; no model request",
+      },
       preflightVerified: {
         registered: true,
         enabledBeforeToggle: true,

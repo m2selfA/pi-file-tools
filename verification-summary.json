@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "0.2.3",
+  "packageVersion": "0.2.4",
   "status": "passed-with-platform-gaps",
-  "verifiedAtUtc": "2026-11-21T17:02:14.213Z",
-  "sourceInputDigest": "d94de8066ec319ceb3f8c17cf684472dccf96488e6503d0ae7e9218a6591ac90",
+  "verifiedAtUtc": "2026-11-22T03:28:48.073Z",
+  "sourceInputDigest": "fb923ef797558244476ba18925fac459b6e98eb1612dc735946722e63152e447",
   "hashScope": "Files selected by scripts/source-state.ts; not a Git commit, binary or memory-image hash.",
   "environment": {
     "platform": "win32",
@@ -12,7 +12,7 @@
   },
   "results": {
     "unit": {
-      "passed": 87,
+      "passed": 89,
       "failed": 0
     },
     "officialLoader": {
@@ -76,6 +76,18 @@
         "linkedSdkContentsTraversed": false,
         "userDataMutations": 0
       }
+    },
+    "localScope": {
+      "singleWordingSource": "src/scope.ts LOCAL_SCOPE",
+      "toolsDeclared": 6,
+      "preflightSection": true,
+      "tempSshGuidance": true,
+      "backupSshGuidance": true,
+      "unitCases": 2,
+      "actualLoaderCallbackVerified": true,
+      "pathParameterDescriptions": ["backup path", "restore destination"],
+      "behaviorChange": "none",
+      "scope": "Prompt and metadata only; not a runtime path interceptor. A remote path string that also exists locally can still be operated on."
     }
   },
   "rawEvidence": {
@@ -90,6 +102,7 @@
     "Preflight verification does not establish real provider payload delivery or model adherence.",
     "Later full-prompt replacement handlers can still override prior guidance.",
     "Recreating Windows file/directory symbolic links requires OS permission; unavailable privilege is reported or skipped, never enabled by the plugin.",
-    "Relative link targets are preserved verbatim and resolve relative to the restored location."
+    "Relative link targets are preserved verbatim and resolve relative to the restored location.",
+    "Local-scope wording is guidance and documentation, not enforcement; none of the six tools inspects SSH state or rejects remote-looking paths."
   ]
 }

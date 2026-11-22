@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4 - 2026-11-22
+
+- Declare one controller-local filesystem scope for all six tools and clarify that paths resolve against the local Pi cwd, never an active SSH remote cwd.
+- Add SSH-specific temp/backup guidance: temp paths stay local, backup never reads remote trees, and remote trees must be downloaded first.
+- Document the family-wide boundary, mounted-share caveat and the fact that this is prompt/doc guidance rather than a path interceptor.
+- Add unit and official-loader assertions for the six descriptions, preflight section and managed SSH rules; no file-operation behavior changed.
+
+
 ## 0.2.3 - 2026-11-21
 
 - Treat nested temp symlinks/junctions as opaque leaves without scanning target contents; retain strict backups and root redirection guards.

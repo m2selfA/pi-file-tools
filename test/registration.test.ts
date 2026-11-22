@@ -9,6 +9,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { registerFileTools } from "../src/index.js";
 import { ManagedStore } from "../src/managed/store.js";
+import { LOCAL_SCOPE } from "../src/scope.js";
 import { fixture } from "./support.js";
 
 function registrationApi(
@@ -56,6 +57,36 @@ test("register exactly six tools, strict schemas and no delete", async (t) => {
     false,
   );
 });
+test("all six tools declare controller-local scope and managed SSH boundaries", async (t) => {
+  const { root, backend } = await fixture(t);
+  const tools: ToolDefinition[] = [];
+  registerFileTools(registrationApi(tools), backend, {
+    root: path.join(root, "managed"),
+  });
+  assert.equal(tools.length, 6);
+  for (const tool of tools)
+    assert.ok((tool.description ?? "").includes(LOCAL_SCOPE), tool.name);
+  const temp = tools.find((tool) => tool.name === "temp");
+  assert.ok(temp);
+  assert.ok(
+    temp.promptGuidelines?.some((rule) =>
+      rule.includes("When an SSH target is active"),
+    ),
+  );
+  assert.ok(
+    temp.promptGuidelines?.some((rule) =>
+      rule.includes("do not pass it to ssh_write"),
+    ),
+  );
+  const backup = tools.find((tool) => tool.name === "backup");
+  assert.ok(backup);
+  assert.ok(
+    backup.promptGuidelines?.some((rule) =>
+      rule.includes("never reads through SSH"),
+    ),
+  );
+});
+
 test("registers session maintenance lifecycle handlers", async (t) => {
   const { root, backend } = await fixture(t);
   const handlers = new Map<string, unknown>();

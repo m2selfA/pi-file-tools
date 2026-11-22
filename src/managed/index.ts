@@ -53,13 +53,25 @@ export function managedSchema(category: Category) {
           "touch",
         ],
       }),
-      path: Type.Optional(Type.String({ minLength: 1 })),
+      path: Type.Optional(
+        Type.String({
+          minLength: 1,
+          description:
+            "Controller-local source path for backup; resolved against the local Pi cwd.",
+        }),
+      ),
       name: Type.Optional(Type.String({ minLength: 1 })),
       kind: Type.Optional(Type.String({ enum: ["file", "directory"] })),
       content: Type.Optional(Type.String()),
       purpose: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
       id: Type.Optional(Type.String({ minLength: 1 })),
-      destination: Type.Optional(Type.String({ minLength: 1 })),
+      destination: Type.Optional(
+        Type.String({
+          minLength: 1,
+          description:
+            "Controller-local restore destination; resolved against the local Pi cwd.",
+        }),
+      ),
       ttlHours: Type.Optional(
         quantity("Hours or a duration such as 24h, 30d or 7w."),
       ),

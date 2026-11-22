@@ -22,6 +22,8 @@ The preflight tests render prompts using the locked development SDK and cover de
 
 The official-loader smoke test invokes the actual registered `before_agent_start` callback in each loader round, toggles an isolated settings file, and checks owned marker presence, deduplication and forced-prefix preservation. This is callback/prompt-construction evidence, not an actual provider request or a measurement of model compliance. Later handlers that replace the entire prompt may still discard prior additions.
 
+Local-scope wording is asserted for all six registered tool descriptions and the preflight section. The same loader rounds record `scopeVerified` after reading the loaded definitions. This is metadata and prompt-construction evidence, not a runtime path guard.
+
 ## Evidence boundaries
 
 - The public summary is derived from local receipts. The private raw receipts are preserved separately and are not independently inspectable from this repository. No independent advisor approval is claimed.

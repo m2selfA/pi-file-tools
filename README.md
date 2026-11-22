@@ -35,6 +35,8 @@ pi install .
 
 ## 工具
 
+所有六个工具只操作 Pi 控制器进程可访问的本地文件系统，路径按本地 Pi cwd 解析，不会通过 SSH 访问远端主机。SSH 激活时，远端文件由 `ssh_*` 工具处理；`temp` 和 `backup` 仍只处理控制器本地路径。
+
 | 工具 | 行为 |
 |---|---|
 | `mkdir` | 创建空目录；默认递归创建父目录；已存在时返回 created:false |
@@ -220,6 +222,14 @@ pi install .
 扩展在 `session_start` 执行一次离线维护，并在会话期间每 15 分钟执行一次可取消的 sweep；`session_shutdown` 会注销定时器。Pi 关闭期间不运行常驻服务。
 
 ## 平台实现与边界
+
+### 控制器本地范围与 SSH
+
+- `temp` 返回的路径始终是控制器本地路径；即使 SSH 激活，也不要把它交给 `ssh_write` 或 `ssh_edit` 当作远端路径。
+- `backup` 不读取 SSH 远端目录。需要备份远端目录时，先用 `ssh_download` 下载到控制器，再对本地副本创建备份。
+- `mkdir`、`copy`、`rename`、`trash` 同样只作用于控制器本地路径；远端删除或移动应使用 `ssh_bash`，其删除语义由远端命令决定，不经过本地回收站。
+- 本机挂载的网络盘仍属于控制器可访问范围；具体后端限制不变，例如 Windows `trash` 拒绝 UNC 路径。
+- 这是提示和文档边界，不是路径拦截器。若把远端路径字符串传给本地工具，而本地恰好存在同名路径，工具仍可能操作该本地路径。
 
 - **Windows**：使用自带 Windows PowerShell 5.1，按需启动一个短命 STA 子进程，通过 IFileOperation 操作真实系统回收站。C# 源码随包分发，Add-Type 在内存中编译；无二进制下载、后台服务或提权。put 使用回收标志和删除前回调；不允许转为永久删除。恢复使用 System.FileName 而非可能隐藏扩展名的显示名。只接受本地盘符绝对路径进行回收，拒绝 UNC/网络路径。
 - **Linux**：使用 Freedesktop home trash（$XDG_DATA_HOME/Trash，默认 ~/.local/share/Trash），要求当前用户所有权和私有目录权限，保存标准 .trashinfo。仅支持同文件系统；其他设备的 put 拒绝执行，不会复制后删除。move 使用 /usr/bin/mv 的 no-clobber 模式；需要 GNU coreutils。暂不枚举其他挂载点的 .Trash-*。

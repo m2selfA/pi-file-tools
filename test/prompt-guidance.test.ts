@@ -92,6 +92,15 @@ test("preflight uses one owned section and preserves project context", () => {
   assert.equal(count(sdk.buildSystemPrompt(value)), 1);
 });
 
+test("preflight declares controller-local scope and SSH download boundary", () => {
+  assert.match(PREFLIGHT_GUIDANCE, /controller-local filesystem/);
+  assert.match(PREFLIGHT_GUIDANCE, /never an active SSH remote host/);
+  assert.match(
+    PREFLIGHT_GUIDANCE,
+    /download a remote tree before backing it up/,
+  );
+});
+
 test("preflight renders with hidden tools and a custom prompt prefix", () => {
   for (const patch of [
     {

@@ -6,6 +6,7 @@ import type { Category } from "./managed/model.js";
 import type { ManagedInput, StoreOptions } from "./managed/store.js";
 import { ManagedStore } from "./managed/store.js";
 import { registerPreflightPrompt } from "./prompt-guidance.js";
+import { LOCAL_SCOPE } from "./scope.js";
 import { createTrashBackend } from "./trash/index.js";
 import { serializedBackend, TrashOperations } from "./trash/service.js";
 import type { OperationResult, TrashBackend } from "./types.js";
@@ -14,7 +15,7 @@ const pathSchema = () =>
   Type.String({
     minLength: 1,
     description:
-      "Path relative to ctx.cwd, or absolute. A leading @ is accepted.",
+      "Path relative to the local Pi ctx.cwd, or absolute. A leading @ is accepted.",
   });
 const outputSchema = Type.Object({
   operation: Type.String(),
@@ -63,10 +64,19 @@ export function registerFileTools(
     name: category,
     label,
     executionMode: "sequential" as const,
-    description: `${category === "backup" ? "Store recoverable snapshots" : "Allocate centrally managed temporary files or directories"}. Actions: create, list, inspect, restore, release, cleanup, policy, pin, touch. Storage and retention are configured in file-tools.json under the Pi agent directory (or PI_FILE_TOOLS_CONFIG); PI_FILE_TOOLS_HOME overrides the storage root, and a leading ~ resolves to the user home. Cleanup defaults to dry-run, respects leases and pins, moves items to the OS trash first, and reports physicalBytesFreed:null until the recorded purge window passes.`,
+    description: `${LOCAL_SCOPE} ${category === "backup" ? "Store recoverable snapshots" : "Allocate centrally managed temporary files or directories"}. Actions: create, list, inspect, restore, release, cleanup, policy, pin, touch. Storage and retention are configured in file-tools.json under the Pi agent directory (or PI_FILE_TOOLS_CONFIG); PI_FILE_TOOLS_HOME overrides the storage root, and a leading ~ resolves to the user home. Cleanup defaults to dry-run, respects leases and pins, moves items to the OS trash first, and reports physicalBytesFreed:null until the recorded purge window passes.`,
     promptSnippet: `${category} management with preview, retention and recovery`,
     promptGuidelines: [
       `Use ${category} action:create before producing ${category === "backup" ? "a recoverable copy" : "temporary output"}; do not write managed paths outside the returned path.`,
+      ...(category === "backup"
+        ? [
+            "When an SSH target is active, backup still manages controller-local files; use ssh_bash, ssh_upload, or ssh_download for remote files.",
+            "backup never reads through SSH; download a remote directory before creating its backup.",
+          ]
+        : [
+            "When an SSH target is active, temp still manages controller-local files; use ssh_bash, ssh_upload, or ssh_download for remote files.",
+            "temp returns a controller-local path even while SSH is active; do not pass it to ssh_write as a remote path.",
+          ]),
       `Use ${category} action:cleanup without execute first; set execute:true only after reviewing the exact plan.`,
       `Use ${category} action:release for one item; active leases and pinned items are protected from automatic cleanup.`,
       `Use ${category} action:restore with the exact id; existing destinations are never overwritten.`,
@@ -149,8 +159,7 @@ export function registerFileTools(
   pi.registerTool({
     name: "mkdir",
     label: "Create directory",
-    description:
-      "Create a directory and missing parents by default. Existing directories are reported; an existing file or symlink is an error.",
+    description: `${LOCAL_SCOPE} Create a directory and missing parents by default. Existing directories are reported; an existing file or symlink is an error.`,
     promptSnippet: "Create directories recursively",
     promptGuidelines: [
       "Use mkdir to create empty directories; recursive defaults to true.",
@@ -171,7 +180,7 @@ export function registerFileTools(
     pi.registerTool({
       name: kind,
       label: kind,
-      description: `${kind === "copy" ? "Copy" : "Move"} a file, symlink or directory to an exact destination. Parent must exist. Existing destinations require overwrite:true and are first moved to the OS trash; the result includes their restore id.${kind === "copy" ? " Directories require recursive:true." : " Cross-volume rename is refused."}`,
+      description: `${LOCAL_SCOPE} ${kind === "copy" ? "Copy" : "Move"} a file, symlink or directory to an exact destination. Parent must exist. Existing destinations require overwrite:true and are first moved to the OS trash; the result includes their restore id.${kind === "copy" ? " Directories require recursive:true." : " Cross-volume rename is refused."}`,
       promptSnippet: `${kind} files and directories; preserve overwritten targets in trash`,
       promptGuidelines: [
         `Use ${kind} with overwrite:true only when replacing the destination is intended; the replaced item stays recoverable in the OS trash.`,
@@ -213,8 +222,7 @@ export function registerFileTools(
     name: "trash",
     label: "Recycle Bin",
     executionMode: "sequential",
-    description:
-      'Manage the real OS Recycle Bin/trash. action: put (path; non-empty directories need recursive:true), list (offset, limit <=200), restore (exact id; optional destination; never overwrite), empty (ids OR all:true; requires confirm:"EMPTY"; permanent; <=256 entries). all:true empties a snapshot of the entire current-user bin, including unrelated items. No permanent-delete fallback for put.',
+    description: `${LOCAL_SCOPE} Manage the real OS Recycle Bin/trash. action: put (path; non-empty directories need recursive:true), list (offset, limit <=200), restore (exact id; optional destination; never overwrite), empty (ids OR all:true; requires confirm:"EMPTY"; permanent; <=256 entries). all:true empties a snapshot of the entire current-user bin, including unrelated items. No permanent-delete fallback for put.`,
     promptSnippet:
       "Move items to OS trash, list, restore, or explicitly empty selected recycled items",
     promptGuidelines: [
