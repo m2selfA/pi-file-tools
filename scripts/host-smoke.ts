@@ -85,7 +85,15 @@ try {
     );
     assert.equal(tempSshGuidance, true);
     assert.equal(backupSshGuidance, true);
-    const context = { cwd: agentDir } as ExtensionToolContext;
+    const sessionId = `host-session-${round}`;
+    const context = {
+      cwd: agentDir,
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => path.join(agentDir, `${sessionId}.jsonl`),
+        getSessionName: () => `Host Round ${round}`,
+      },
+    } as unknown as ExtensionToolContext;
     const mk = ours.tools.get("mkdir");
     assert.ok(mk);
     const made = await mk.definition.execute(
@@ -125,6 +133,35 @@ try {
       allocatedResult.result.item.expiresAt -
         allocatedResult.result.item.createdAt,
       6 * 3600000,
+    );
+    const sessionList = await temp.definition.execute(
+      `temp-list-session-${round}`,
+      { action: "list", scope: "session" },
+      undefined,
+      undefined,
+      context,
+    );
+    const sessionListResult = sessionList.structuredContent as unknown as {
+      result: {
+        scope: string;
+        currentSessionId: string;
+        items: { sessionId?: string }[];
+      };
+    };
+    assert.equal(sessionListResult.result.scope, "session");
+    assert.equal(sessionListResult.result.currentSessionId, sessionId);
+    assert.ok(
+      sessionListResult.result.items.length >= 1 &&
+        sessionListResult.result.items.every((i) => i.sessionId === sessionId),
+    );
+    const sessionHeartbeat = path.join(
+      configuredRoot,
+      "sessions",
+      `${sessionId}.json`,
+    );
+    assert.equal(
+      JSON.parse(await readFile(sessionHeartbeat, "utf8")).sessionId,
+      sessionId,
     );
     const backup = ours.tools.get("backup");
     assert.ok(backup);
@@ -214,9 +251,27 @@ try {
     console.warn = (...args: unknown[]) => {
       maintenanceWarnings.push(args.join(" "));
     };
+    const waitFor = async (
+      predicate: () => Promise<boolean> | boolean,
+      timeoutMs = 5000,
+    ) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!(await predicate())) {
+        if (Date.now() >= deadline)
+          throw new Error("Timed out waiting for background startup sweep.");
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+    };
+    const configFile = process.env.PI_FILE_TOOLS_CONFIG;
+    assert.ok(configFile);
+    const savedSettings = JSON.parse(await readFile(configFile, "utf8"));
+    savedSettings.sweepCooldownMinutes = 0;
+    await writeFile(configFile, JSON.stringify(savedSettings));
     try {
+      const t0 = Date.now();
       await start({ type: "session_start" }, { cwd: agentDir, hasUI: false });
-      assert.equal(maintenanceWarnings.length, 1);
+      assert.ok(Date.now() - t0 < 1000, "session_start must stay non-blocking");
+      await waitFor(() => maintenanceWarnings.length === 1);
       assert.ok(maintenanceWarnings[0].includes(damagedItem.id));
       const inspectDamage = await temp.definition.execute(
         `inspect-damage-${round}`,
@@ -234,6 +289,21 @@ try {
       assert.ok(damagedState.inspectionError);
       await writeFile(damagedItem.path, "repair me");
       await start({ type: "session_start" }, { cwd: agentDir, hasUI: false });
+      await waitFor(async () => {
+        const res = await temp.definition.execute(
+          `inspect-repaired-${round}`,
+          { action: "inspect", id: damagedItem.id },
+          undefined,
+          undefined,
+          context,
+        );
+        const item = (
+          res.structuredContent as unknown as {
+            result: { item: { inspectionError?: string } };
+          }
+        ).result.item;
+        return item.inspectionError === undefined;
+      });
       assert.equal(maintenanceWarnings.length, 1);
       const healthy = await temp.definition.execute(
         `inspect-link-${round}`,
@@ -253,10 +323,16 @@ try {
         await readFile(path.join(outsideSdk, "keep.txt"), "utf8"),
         "KEEP SDK TARGET",
       );
+      savedSettings.sweepCooldownMinutes = 5;
+      await writeFile(configFile, JSON.stringify(savedSettings));
+      await start({ type: "session_start" }, context);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(maintenanceWarnings.length, 1);
     } finally {
       console.warn = originalWarn;
       await stop({ type: "session_shutdown" }, { cwd: agentDir, hasUI: false });
     }
+    await assert.rejects(readFile(sessionHeartbeat, "utf8"));
     const hooks = ours.handlers.get("before_agent_start");
     assert.equal(hooks?.length, 1);
     const hook = hooks[0] as (
@@ -285,8 +361,6 @@ try {
     assert.match(preflightText, /controller-local filesystem/);
     await hook(promptEvent, context);
     assert.equal(markerCount(), 1);
-    const configFile = process.env.PI_FILE_TOOLS_CONFIG;
-    assert.ok(configFile);
     const fixtureSettings = JSON.parse(await readFile(configFile, "utf8"));
     fixtureSettings.preflightPrompt = false;
     await writeFile(configFile, JSON.stringify(fixtureSettings));
@@ -349,6 +423,14 @@ try {
         forcedPromptFallback: true,
         agentsFileUnchanged: true,
         scope: "actual loaded callback with in-memory event; no model request",
+      },
+      multiSessionVerified: {
+        sessionIdRecorded: true,
+        sessionHeartbeatCreatedAndRemoved: true,
+        sessionScopeFiltered: true,
+        nonBlockingStartup: true,
+        cooldownSkipVerified: true,
+        scope: "actual loaded extension with sessionManager context",
       },
       startupIsolationVerified: {
         nestedLinkScannedWithoutDereference: true,

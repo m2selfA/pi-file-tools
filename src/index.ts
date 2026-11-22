@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { FileOperations } from "./files.js";
 import { managedSchema } from "./managed/index.js";
 import type { Category } from "./managed/model.js";
+import type { SessionIdentity } from "./managed/sessions.js";
 import type { ManagedInput, StoreOptions } from "./managed/store.js";
 import { ManagedStore } from "./managed/store.js";
 import { registerPreflightPrompt } from "./prompt-guidance.js";
@@ -47,6 +48,35 @@ function response(operation: string, result: OperationResult) {
   };
 }
 
+interface SessionContextLike {
+  cwd?: string;
+  mode?: string;
+  hasUI?: boolean;
+  ui?: { notify(message: string, type?: "info" | "warning" | "error"): void };
+  sessionManager?: {
+    getSessionId?: () => string;
+    getSessionFile?: () => string | undefined;
+    getSessionName?: () => string | undefined;
+  };
+}
+
+function sessionFromContext(
+  ctx?: SessionContextLike,
+): SessionIdentity | undefined {
+  const sessionId = ctx?.sessionManager?.getSessionId?.();
+  if (!ctx || !sessionId) return undefined;
+  return {
+    sessionId,
+    sessionFile: ctx.sessionManager?.getSessionFile?.(),
+    sessionName: ctx.sessionManager?.getSessionName?.(),
+    cwd: ctx.cwd,
+  };
+}
+
+function isInteractiveTui(ctx?: SessionContextLike): boolean {
+  return ctx?.hasUI === true && ctx?.mode === "tui";
+}
+
 /** Backend injection is for deterministic unit tests; normal Pi loading uses the OS backend. */
 export function registerFileTools(
   pi: ExtensionAPI,
@@ -60,6 +90,10 @@ export function registerFileTools(
   if (typeof pi.on === "function")
     registerPreflightPrompt(pi, managed.settingsPath);
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
+  let sessionAbort: AbortController | undefined;
+  let activeSession: SessionIdentity | undefined;
+  let latestContext: SessionContextLike | undefined;
+
   const managedTool = (category: Category, label: string) => ({
     name: category,
     label,
@@ -88,23 +122,31 @@ export function registerFileTools(
       input: unknown,
       signal: AbortSignal | undefined,
       _update: unknown,
-      ctx: { cwd: string },
+      ctx: SessionContextLike & { cwd: string },
     ) {
+      const session = sessionFromContext(ctx);
+      if (session) activeSession = session;
+      const owner = session?.sessionId ? `pi:${session.sessionId}` : "pi";
       return response(
         category,
         await managed.execute(
           category,
           input as ManagedInput,
           ctx.cwd,
-          "pi",
+          owner,
           signal,
+          { session },
         ),
       );
     },
   });
   pi.registerTool(managedTool("backup", "Managed backups"));
   pi.registerTool(managedTool("temp", "Managed temporary files"));
-  const reportMaintenance = (result: OperationResult): string | undefined => {
+
+  const reportMaintenance = (
+    result: OperationResult,
+    ctx?: SessionContextLike,
+  ): string | undefined => {
     const failed = Array.isArray(result.failed)
       ? (result.failed as { id: string; error: string }[])
       : [];
@@ -113,48 +155,78 @@ export function registerFileTools(
       .slice(0, 8)
       .map((i) => i.id)
       .join(", ")} before retrying.`;
-    console.warn(`[pi-file-tools] ${message}`);
+    if (!isInteractiveTui(ctx)) console.warn(`[pi-file-tools] ${message}`);
     return message;
   };
+
+  const runMaintenance = async (
+    trigger: "startup" | "timer",
+    ctx: SessionContextLike | undefined,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    const session = sessionFromContext(ctx) ?? activeSession;
+    if (session) activeSession = session;
+    const owner = session?.sessionId ? `pi:${session.sessionId}` : "pi-session";
+    try {
+      const result = await managed.maintain(owner, {
+        background: true,
+        signal,
+        maxActions: 10,
+        session,
+      });
+      if (signal.aborted) return;
+      if (result.skipped) return;
+      const warning = reportMaintenance(result, ctx);
+      if (ctx?.hasUI && (warning || trigger === "startup"))
+        ctx.ui?.notify(
+          warning ?? `Managed backup/temp sweep ready at ${managed.root}`,
+          warning ? "warning" : "info",
+        );
+    } catch (error) {
+      if (signal.aborted) return;
+      const message = `Managed maintenance failed; inspect recorded state before retrying: ${error instanceof Error ? error.message : String(error)}`;
+      if (!isInteractiveTui(ctx)) console.error(`[pi-file-tools] ${message}`);
+      if (ctx?.hasUI) ctx.ui?.notify(message, "warning");
+    } finally {
+      if (!signal.aborted && session)
+        await managed.touchSessionHeartbeat(session).catch(() => {});
+    }
+  };
+
   if (typeof pi.on === "function")
     pi.on("session_start", async (_event, ctx) => {
-      // A failed first sweep must not prevent later retries or tool availability.
+      const context = ctx as SessionContextLike | undefined;
+      latestContext = context;
+      sessionAbort?.abort();
+      const controller = new AbortController();
+      sessionAbort = controller;
+      activeSession = sessionFromContext(context);
+      // A failed or skipped first sweep must not block startup or prevent later retries.
       if (sweepTimer === undefined) {
         sweepTimer = setInterval(
           () => {
-            void managed
-              .maintain("pi-session")
-              .then(reportMaintenance)
-              .catch((error) =>
-                console.error(
-                  `[pi-file-tools] managed sweep failed: ${error instanceof Error ? error.message : String(error)}`,
-                ),
-              );
+            const signal = sessionAbort?.signal;
+            if (signal) void runMaintenance("timer", latestContext, signal);
           },
           15 * 60 * 1000,
         );
         sweepTimer.unref?.();
       }
-      try {
-        const result = await managed.maintain("pi-session");
-        const warning = reportMaintenance(result);
-        if (ctx.hasUI)
-          ctx.ui.notify(
-            warning ?? `Managed backup/temp sweep ready at ${managed.root}`,
-            warning ? "warning" : "info",
-          );
-      } catch (error) {
-        const message = `Managed maintenance failed; inspect recorded state before retrying: ${error instanceof Error ? error.message : String(error)}`;
-        console.error(`[pi-file-tools] ${message}`);
-        if (ctx.hasUI) ctx.ui.notify(message, "warning");
-      }
+      void runMaintenance("startup", context, controller.signal);
     });
   if (typeof pi.on === "function")
-    pi.on("session_shutdown", () => {
+    pi.on("session_shutdown", async () => {
+      sessionAbort?.abort();
+      sessionAbort = undefined;
       if (sweepTimer !== undefined) {
         clearInterval(sweepTimer);
         sweepTimer = undefined;
       }
+      const session = activeSession;
+      activeSession = undefined;
+      latestContext = undefined;
+      if (session?.sessionId)
+        await managed.endSession(session.sessionId).catch(() => undefined);
     });
   pi.registerTool({
     name: "mkdir",

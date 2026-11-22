@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
-import { mkdir, open, rename, rmdir } from "node:fs/promises";
+import { mkdir, open, rename } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolvePath } from "../paths.js";
+import { formatLockDiagnostics, withFileLock } from "./locks.js";
 import {
   type Category,
   DEFAULT_POLICIES,
@@ -20,6 +20,9 @@ export interface ManagedSettings {
   version: 1;
   storageRoot?: string;
   preflightPrompt?: boolean;
+  lockWaitMs?: number;
+  sweepCooldownMinutes?: number;
+  autoReclaimStaleLocks?: boolean;
   policies?: Partial<Record<Category, Partial<Policy>>>;
 }
 
@@ -76,9 +79,15 @@ export function parseSettings(value: unknown): ManagedSettings {
     !object(value) ||
     Object.keys(value).some(
       (key) =>
-        !["version", "storageRoot", "preflightPrompt", "policies"].includes(
-          key,
-        ),
+        ![
+          "version",
+          "storageRoot",
+          "preflightPrompt",
+          "lockWaitMs",
+          "sweepCooldownMinutes",
+          "autoReclaimStaleLocks",
+          "policies",
+        ].includes(key),
     )
   )
     throw new Error("Unknown settings field or invalid settings object.");
@@ -94,6 +103,27 @@ export function parseSettings(value: unknown): ManagedSettings {
     typeof value.preflightPrompt !== "boolean"
   )
     throw new Error("preflightPrompt must be a boolean.");
+  if (
+    value.lockWaitMs !== undefined &&
+    (typeof value.lockWaitMs !== "number" ||
+      !Number.isSafeInteger(value.lockWaitMs) ||
+      value.lockWaitMs < 100 ||
+      value.lockWaitMs > 300_000)
+  )
+    throw new Error("lockWaitMs must be an integer from 100 to 300000.");
+  if (
+    value.sweepCooldownMinutes !== undefined &&
+    (typeof value.sweepCooldownMinutes !== "number" ||
+      !Number.isFinite(value.sweepCooldownMinutes) ||
+      value.sweepCooldownMinutes < 0 ||
+      value.sweepCooldownMinutes > 1440)
+  )
+    throw new Error("sweepCooldownMinutes must be a number from 0 to 1440.");
+  if (
+    value.autoReclaimStaleLocks !== undefined &&
+    typeof value.autoReclaimStaleLocks !== "boolean"
+  )
+    throw new Error("autoReclaimStaleLocks must be a boolean.");
   if (value.policies !== undefined) {
     if (
       !object(value.policies) ||
@@ -122,6 +152,15 @@ export function parseSettings(value: unknown): ManagedSettings {
       : {}),
     ...(typeof value.preflightPrompt === "boolean"
       ? { preflightPrompt: value.preflightPrompt }
+      : {}),
+    ...(typeof value.lockWaitMs === "number"
+      ? { lockWaitMs: value.lockWaitMs }
+      : {}),
+    ...(typeof value.sweepCooldownMinutes === "number"
+      ? { sweepCooldownMinutes: value.sweepCooldownMinutes }
+      : {}),
+    ...(typeof value.autoReclaimStaleLocks === "boolean"
+      ? { autoReclaimStaleLocks: value.autoReclaimStaleLocks }
       : {}),
     ...(value.policies !== undefined ? { policies } : {}),
   };
@@ -163,56 +202,50 @@ export async function savePolicy(
   await noLinks(filename);
   await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
   const lock = `${filename}.lock`;
-  const deadline = Date.now() + 2000;
-  for (;;) {
-    try {
-      await mkdir(lock, { mode: 0o700 });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (Date.now() >= deadline)
-        throw new Error(
-          `Settings locked: ${lock}; inspect other Pi sessions before removing a stale lock.`,
-        );
-      await delay(25);
-    }
-  }
-  try {
-    await noLinks(filename);
-    const current = readSettingsFile(filename);
-    const normalized = normalizePolicyPatch(patch, `policies.${category}`);
-    const policy = {
-      ...fallback,
-      ...current.settings.policies?.[category],
-      ...normalized,
-    };
-    validatePolicy(policy);
-    const next: SettingsDocument = {
-      ...current.document,
-      policies: {
-        ...current.document.policies,
-        [category]: {
-          ...policy,
-          ...current.document.policies?.[category],
-          ...patch,
+  return withFileLock(
+    {
+      lockPath: lock,
+      operation: `settings:policy:${category}`,
+      waitMs: 5000,
+      autoReclaimStale: true,
+      busyMessage: (lockPath, owner) =>
+        `Settings locked: ${formatLockDiagnostics(lockPath, owner)}; inspect other Pi sessions before removing a stale lock.`,
+    },
+    async () => {
+      await noLinks(filename);
+      const current = readSettingsFile(filename);
+      const normalized = normalizePolicyPatch(patch, `policies.${category}`);
+      const policy = {
+        ...fallback,
+        ...current.settings.policies?.[category],
+        ...normalized,
+      };
+      validatePolicy(policy);
+      const next: SettingsDocument = {
+        ...current.document,
+        policies: {
+          ...current.document.policies,
+          [category]: {
+            ...policy,
+            ...current.document.policies?.[category],
+            ...patch,
+          },
         },
-      },
-    };
-    parseSettings(next);
-    const temporary = path.join(
-      path.dirname(filename),
-      `.${path.basename(filename)}-${randomUUID()}.tmp`,
-    );
-    const file = await open(temporary, "wx", 0o600);
-    try {
-      await file.writeFile(`${JSON.stringify(next, null, 2)}\n`);
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temporary, filename);
-    return policy;
-  } finally {
-    await rmdir(lock);
-  }
+      };
+      parseSettings(next);
+      const temporary = path.join(
+        path.dirname(filename),
+        `.${path.basename(filename)}-${randomUUID()}.tmp`,
+      );
+      const file = await open(temporary, "wx", 0o600);
+      try {
+        await file.writeFile(`${JSON.stringify(next, null, 2)}\n`);
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      await rename(temporary, filename);
+      return policy;
+    },
+  );
 }

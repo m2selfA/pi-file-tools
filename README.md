@@ -120,7 +120,7 @@ pi install .
 
 `backup` 和 `temp` 使用同一个受管存储根目录，默认位于 Pi agent 数据目录下的 `file-tools`。在 Pi agent 目录下的 `file-tools.json` 设置 `storageRoot` 可更改位置，支持绝对路径、`~`、`~/…` 和 `~\…`。环境变量 `PI_FILE_TOOLS_HOME` 优先于文件设置。存储根包含原子 `state.json`、用途和项目元数据、SHA-256 摘要，以及 `backup` 和 `temp` 两个类别目录。首次接管非空目录会拒绝，避免覆盖未知文件。
 
-两个工具都支持 `create`、`list`、`inspect`、`restore`、`release`、`cleanup`、`policy`、`pin`、`touch`。`cleanup` 默认只返回计划，必须显式 `execute:true` 才会操作。临时项创建后有 15 分钟租约，`touch` 可续租；`pinned:true` 项不会自动释放。
+两个工具都支持 `create`、`list`、`inspect`、`restore`、`release`、`cleanup`、`policy`、`pin`、`touch`。`list` 支持可选 `scope`（`session` / `project` / `all`，默认 `all`）按当前 Pi 对话或本地项目过滤。`cleanup` 默认只返回计划，必须显式 `execute:true` 才会操作。临时项创建后有 15 分钟租约，`touch` 可续租；`pinned:true` 项不会自动释放。
 
 ### 链接目录与部分维护
 
@@ -179,6 +179,9 @@ pi install .
 - `maxBytes`：活跃容量上限，单位字节，最大 1 PiB（`"1P"`）；例如 `"2G"` 或 `"1.5GiB"`。
 - `purgeAfterHours`：移入回收站后的最短保留时间；和 TTL 一样接受 1–876000 小时，或 `"7d"`、`"100y"` 等时长。
 - `maxRecycledBytes`：受管回收条目的容量预算，最大 1 PiB；接受 `"1G"` 等写法。超预算也不会提前缩短回收站保留期，必要时阻止继续分配。
+- `lockWaitMs`（可选）：显式写操作等待存储锁的毫秒上限，整数 100–300000，默认 15000。
+- `sweepCooldownMinutes`（可选）：多会话后台维护去重冷却分钟数，0–1440，默认 5；设为 0 关闭冷却。
+- `autoReclaimStaleLocks`（可选）：默认 `true`；仅在同主机确认持锁进程已死且 `state.json` 无 `creating`/`recycling`/`purging` 未决状态时安全接管陈旧锁。
 
 数量和容量的 `k/K`、`m/M`、`g/G`、`t/T`、`p/P` 均按 1024 的幂换算；容量也接受 KB、KiB、MB、MiB 等别名，**这里 KB/MB/GB 同样按二进制解释**。无后缀字符串与普通数字含义相同。含单位的值在 JSON 中必须加引号。数量和字节最终必须是精确整数：`"1.5G"` 合法，`"0.1k"` 不会被静默取整。
 
@@ -219,7 +222,14 @@ pi install .
 {"action":"cleanup","execute":true}
 ```
 
-扩展在 `session_start` 执行一次离线维护，并在会话期间每 15 分钟执行一次可取消的 sweep；`session_shutdown` 会注销定时器。Pi 关闭期间不运行常驻服务。
+扩展在 `session_start` 异步触发一次非阻塞维护，并在会话期间每 15 分钟执行一次可取消的 sweep；`session_shutdown` 会中止运行中的维护、注销定时器并清理当前会话心跳。Pi 关闭期间不运行常驻服务。
+
+### 多进程与多对话并发
+
+- **无锁只读与轻量扫描**：`list`、`inspect` 和 `policy` 预览直接读取原子替换的 `state.json`；`temp` 定期扫描只统计元数据与链接，不计算文件内容 SHA-256（`restore` 导出时仍校验完整摘要）。
+- **锁外暂存与单条目锁**：`backup create` 先在 `.staging/` 完成复制与摘要校验，再进短锁原子提交；`restore` 导出复制在短锁校验后移出全局锁，由 `.item-locks/` 防止并发回收同一条目。
+- **多会话去重与心跳保护**：后台维护通过 `.maintenance.lock` 非阻塞抢占和 `lastSweep` 冷却避免多会话重复全扫；存活会话在 `sessions/` 维护心跳，保护其未过期 `temp` 项不被其他会话配额淘汰，会话退出或进程死亡后自动解除。
+- **跨进程回收站互斥与失败隔离**：Windows 回收站后端使用跨进程互斥锁（加锁顺序固定为存储锁先于回收站锁）；历史 `failed` 快照保留现场并持续报告，不再阻塞其他会话的健康操作，只有 `creating`/`recycling`/`purging` 未决状态继续全局阻断。
 
 ## 平台实现与边界
 

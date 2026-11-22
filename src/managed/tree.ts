@@ -28,6 +28,7 @@ export interface Tree {
   kind: "file" | "directory";
   bytes: number;
   digest: string;
+  hashed: boolean;
   entries: Entry[];
   linkCount: number;
 }
@@ -37,6 +38,7 @@ export async function inspectTree(
   maxBytes: number = MANAGED_LIMITS.maxBytes,
   signal?: AbortSignal,
   links: "reject" | "opaque" = "reject",
+  hashFiles = true,
 ): Promise<Tree> {
   const entries: Entry[] = [];
   let bytes = 0;
@@ -89,6 +91,15 @@ export async function inspectTree(
     } else {
       bytes += info.size;
       if (bytes > maxBytes) throw new Error("Tree exceeds the byte budget.");
+      if (!hashFiles) {
+        entries.push({
+          name,
+          kind: "file",
+          size: info.size,
+          mode: info.mode & 0o777,
+        });
+        return;
+      }
       const file = await open(
         value,
         constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
@@ -139,25 +150,28 @@ export async function inspectTree(
   }
   await visit(root, "");
   // Permissions are metadata, not part of byte-level restoration equivalence on Windows.
-  const digest = createHash("sha256")
-    .update(
-      JSON.stringify(
-        entries.map(({ name, kind, size, hash, target }) => ({
-          name,
-          kind,
-          size,
-          hash,
-          ...(target !== undefined ? { target } : {}),
-        })),
-      ),
-    )
-    .digest("hex");
+  const digest = hashFiles
+    ? createHash("sha256")
+        .update(
+          JSON.stringify(
+            entries.map(({ name, kind, size, hash, target }) => ({
+              name,
+              kind,
+              size,
+              hash,
+              ...(target !== undefined ? { target } : {}),
+            })),
+          ),
+        )
+        .digest("hex")
+    : "";
   const kind = entries[0].kind;
   if (kind === "link") throw new Error("Managed item roots must not be links.");
   return {
     kind,
     bytes,
     digest,
+    hashed: hashFiles,
     entries,
     linkCount: entries.filter((entry) => entry.kind === "link").length,
   };

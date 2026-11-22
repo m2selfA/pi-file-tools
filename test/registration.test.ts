@@ -246,6 +246,130 @@ test("partial startup maintenance is a warning rather than a ready notification"
   }
 });
 
+test("non-blocking session_start aborts on shutdown and avoids raw stderr in TUI mode", async (t) => {
+  const { root, backend } = await fixture(t);
+  const handlers = new Map<string, unknown>();
+  const original = {
+    maintain: ManagedStore.prototype.maintain,
+    set: globalThis.setInterval,
+    clear: globalThis.clearInterval,
+    error: console.error,
+    warn: console.warn,
+  };
+  let aborted = false;
+  let resolveMaintain!: () => void;
+  const maintainGate = new Promise<void>((resolve) => {
+    resolveMaintain = resolve;
+  });
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const notifications: { message: string; kind: string }[] = [];
+  globalThis.setInterval = (() => ({
+    unref() {},
+  })) as unknown as typeof setInterval;
+  globalThis.clearInterval = (() => {}) as typeof clearInterval;
+  console.error = (...args: unknown[]) => errors.push(args.join(" "));
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  ManagedStore.prototype.maintain = async (_owner, options) => {
+    options?.signal?.addEventListener("abort", () => {
+      aborted = true;
+    });
+    await maintainGate;
+    return { status: "ok", failed: [] };
+  };
+  try {
+    registerFileTools(registrationApi([], handlers), backend, {
+      root: path.join(root, "managed"),
+    });
+    const start = handlers.get("session_start") as (
+      e: unknown,
+      c: unknown,
+    ) => Promise<void>;
+    const shutdown = handlers.get("session_shutdown") as () => Promise<void>;
+    const t0 = Date.now();
+    await start(
+      {},
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          notify: (message: string, kind: string) =>
+            notifications.push({ message, kind }),
+        },
+      },
+    );
+    assert.ok(
+      Date.now() - t0 < 200,
+      "session_start must not block on maintain",
+    );
+    await shutdown();
+    assert.equal(aborted, true);
+    resolveMaintain();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(notifications.length, 0);
+    assert.equal(errors.length, 0);
+    assert.equal(warnings.length, 0);
+  } finally {
+    ManagedStore.prototype.maintain = original.maintain;
+    globalThis.setInterval = original.set;
+    globalThis.clearInterval = original.clear;
+    console.error = original.error;
+    console.warn = original.warn;
+  }
+});
+
+test("TUI mode suppresses raw console.error/warn while non-TUI logs them", async (t) => {
+  const { root, backend } = await fixture(t);
+  const handlers = new Map<string, unknown>();
+  const original = {
+    maintain: ManagedStore.prototype.maintain,
+    set: globalThis.setInterval,
+    clear: globalThis.clearInterval,
+    error: console.error,
+  };
+  const errors: string[] = [];
+  const notifications: { message: string; kind: string }[] = [];
+  globalThis.setInterval = (() => ({
+    unref() {},
+  })) as unknown as typeof setInterval;
+  globalThis.clearInterval = (() => {}) as typeof clearInterval;
+  console.error = (...args: unknown[]) => errors.push(args.join(" "));
+  ManagedStore.prototype.maintain = async () => {
+    throw new Error("tui-safe-error");
+  };
+  try {
+    registerFileTools(registrationApi([], handlers), backend, {
+      root: path.join(root, "managed"),
+    });
+    const start = handlers.get("session_start") as (
+      e: unknown,
+      c: unknown,
+    ) => Promise<void>;
+    const shutdown = handlers.get("session_shutdown") as () => Promise<void>;
+    await start(
+      {},
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          notify: (message: string, kind: string) =>
+            notifications.push({ message, kind }),
+        },
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(errors.length, 0);
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].kind, "warning");
+    await shutdown();
+  } finally {
+    ManagedStore.prototype.maintain = original.maintain;
+    globalThis.setInterval = original.set;
+    globalThis.clearInterval = original.clear;
+    console.error = original.error;
+  }
+});
+
 test("partial empty failure is an error with structured details", async (t) => {
   const { root, backend } = await fixture(t);
   await writeFile(path.join(root, "a"), "a");

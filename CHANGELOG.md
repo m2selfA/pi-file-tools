@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 - 2026-11-22
+
+- Eliminate lock contention across concurrent Pi sessions: skip SHA-256 during `temp` scans, move `backup create` staging and `restore` copy-out outside the global store lock, and make `list`/`inspect`/`policy` previews lock-free.
+- Add in-process lock queues, atomic `owner.json` diagnostics, PID-reuse-aware stale-lock detection (refusing auto-reclaim when `creating`/`recycling`/`purging` states exist), and cross-process `WindowsTrash` serialization.
+- Make `session_start` maintenance non-blocking and cancellable on `session_shutdown`, deduplicate background sweeps via `.maintenance.lock` and `lastSweep` cooldown, bound per-sweep cleanup actions, and suppress raw stderr writes in interactive TUI mode.
+- Add Pi session identity (`sessionId`, `sessionFile`), lightweight `sessions/` heartbeats protecting active-session `temp` items, `list` `scope` filtering (`session`/`project`/`all`), and isolation of historical `failed` items from unrelated sessions.
+- Add optional `lockWaitMs`, `sweepCooldownMinutes`, and `autoReclaimStaleLocks` settings plus multi-process and native concurrency tests.
+
+
 ## 0.2.4 - 2026-11-22
 
 - Declare one controller-local filesystem scope for all six tools and clarify that paths resolve against the local Pi cwd, never an active SSH remote cwd.

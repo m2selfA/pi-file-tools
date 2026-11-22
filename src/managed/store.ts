@@ -6,9 +6,11 @@ import {
   readdir,
   readFile,
   rename,
+  rm,
   rmdir,
   writeFile,
 } from "node:fs/promises";
+import { hostname } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { FileOperations } from "../files.js";
@@ -29,6 +31,17 @@ import {
 } from "../types.js";
 import { encodeRegistry, MANAGED_LIMITS } from "./limits.js";
 import {
+  acquireFileLock,
+  CURRENT_PROCESS_INSTANCE_ID,
+  formatLockDiagnostics,
+  isOwnerProvablyDead,
+  type LockHandle,
+  type LockOwner,
+  tryAcquireFileLock,
+  tryWithFileLock,
+  withFileLock,
+} from "./locks.js";
+import {
   type Category,
   DEFAULT_POLICIES,
   type Item,
@@ -41,6 +54,12 @@ import {
   validatePolicy,
 } from "./model.js";
 import { type HumanNumber, parseQuantity } from "./quantities.js";
+import {
+  readActiveSessions,
+  removeSession,
+  type SessionIdentity,
+  touchSession,
+} from "./sessions.js";
 import {
   defaultSettings,
   defaultSettingsPath,
@@ -75,6 +94,7 @@ export interface ManagedInput {
   execute?: boolean;
   offset?: number;
   limit?: number;
+  scope?: "session" | "project" | "all";
   policy?: PolicyInput;
 }
 type NormalizedInput = Omit<ManagedInput, "ttlHours" | "policy"> & {
@@ -87,7 +107,31 @@ export interface StoreOptions {
   now?: () => number;
   files?: FileOperations;
   lockWaitMs?: number;
+  sweepCooldownMs?: number;
+  autoReclaimStaleLocks?: boolean;
+  session?: SessionIdentity;
 }
+export interface MaintainOptions {
+  background?: boolean;
+  signal?: AbortSignal;
+  maxActions?: number;
+  session?: SessionIdentity;
+}
+export interface ExecuteOptions {
+  session?: SessionIdentity;
+}
+
+type PreInspection =
+  | { ok: true; tree: Tree; verifiedAt: number }
+  | { ok: false; error: string };
+
+interface StagingMeta {
+  pid: number;
+  processInstanceId: string;
+  hostname: string;
+  startedAtMs: number;
+}
+
 const marker = ".pi-file-tools-store";
 const states = [
   "creating",
@@ -98,6 +142,9 @@ const states = [
   "purged",
   "failed",
 ];
+const UNRESOLVED_STATES = ["creating", "recycling", "purging"];
+const DEFAULT_LOCK_WAIT_MS = 15_000;
+const DEFAULT_SWEEP_COOLDOWN_MS = 5 * 60 * 1000;
 
 export class ManagedStore {
   readonly root: string;
@@ -105,7 +152,10 @@ export class ManagedStore {
   private readonly rootOverride: string | undefined;
   private readonly now: () => number;
   private readonly files: FileOperations;
-  private readonly lockWaitMs: number;
+  private readonly lockWaitMsOverride: number | undefined;
+  private readonly sweepCooldownMsOverride: number | undefined;
+  private readonly autoReclaimOverride: boolean | undefined;
+  private readonly defaultSession: SessionIdentity | undefined;
   constructor(
     private readonly trash: TrashBackend,
     options: StoreOptions = {},
@@ -134,7 +184,10 @@ export class ManagedStore {
     );
     this.now = options.now ?? Date.now;
     this.files = options.files ?? new FileOperations(trash);
-    this.lockWaitMs = options.lockWaitMs ?? 2000;
+    this.lockWaitMsOverride = options.lockWaitMs;
+    this.sweepCooldownMsOverride = options.sweepCooldownMs;
+    this.autoReclaimOverride = options.autoReclaimStaleLocks;
+    this.defaultSession = options.session;
   }
   private settings(): ManagedSettings {
     const settings = this.settingsPath
@@ -151,13 +204,57 @@ export class ManagedStore {
       );
     return settings;
   }
-  private async transaction<T>(
-    fn: (state: StoreState, save: () => Promise<void>) => Promise<T>,
-    initialize = true,
-  ): Promise<T | undefined> {
-    const settings = this.settings();
+  private lockWaitMs(settings: ManagedSettings): number {
+    return (
+      this.lockWaitMsOverride ?? settings.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS
+    );
+  }
+  private sweepCooldownMs(settings: ManagedSettings): number {
+    if (this.sweepCooldownMsOverride !== undefined)
+      return this.sweepCooldownMsOverride;
+    if (settings.sweepCooldownMinutes !== undefined)
+      return settings.sweepCooldownMinutes * 60_000;
+    return DEFAULT_SWEEP_COOLDOWN_MS;
+  }
+  private autoReclaimStale(settings: ManagedSettings): boolean {
+    return this.autoReclaimOverride ?? settings.autoReclaimStaleLocks ?? true;
+  }
+  private itemLockPath(id: string): string {
+    return path.join(this.root, ".item-locks", `${id}.lock`);
+  }
+  private async canReclaimStoreLock(): Promise<{
+    ok: boolean;
+    reason?: string;
+  }> {
+    const statePath = path.join(this.root, "state.json");
+    if (!(await exists(statePath))) return { ok: true };
+    try {
+      await noLinks(statePath);
+      const info = await lstat(statePath);
+      if (!info.isFile() || info.size > MANAGED_LIMITS.registryBytes)
+        return { ok: false, reason: "Registry file is invalid or oversized." };
+      const state = JSON.parse(await readFile(statePath, "utf8")) as StoreState;
+      if (!Array.isArray(state.items))
+        return { ok: false, reason: "Registry items array is malformed." };
+      const unresolved = state.items.filter((i) =>
+        UNRESOLVED_STATES.includes(i.state),
+      );
+      if (unresolved.length)
+        return {
+          ok: false,
+          reason: `Unresolved managed operations exist (${unresolved.map((i) => i.id).join(", ")}); inspect state before clearing lock.`,
+        };
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `Registry could not be verified (${errorMessage(error)}).`,
+      };
+    }
+  }
+  private async ensureRootDirectory(initialize: boolean): Promise<boolean> {
     if (!(await exists(this.root))) {
-      if (!initialize) return undefined;
+      if (!initialize) return false;
       await noLinks(this.root);
       await mkdir(this.root, { recursive: true, mode: 0o700 });
     }
@@ -171,34 +268,118 @@ export class ManagedStore {
       throw new Error(
         "Managed root must be a private, current-user directory.",
       );
-    const lock = path.join(this.root, ".lock");
-    const deadline = Date.now() + this.lockWaitMs;
-    for (;;) {
+    return true;
+  }
+  private async readAndValidateState(
+    settings: ManagedSettings,
+  ): Promise<StoreState> {
+    const markerPath = path.join(this.root, marker);
+    const statePath = path.join(this.root, "state.json");
+    if ((await readFile(markerPath, "utf8")) !== "pi-file-tools-managed-v1\n")
+      throw new Error("Unknown store marker; refusing to overwrite.");
+    await noLinks(statePath);
+    const file = await lstat(statePath);
+    if (!file.isFile() || file.size > MANAGED_LIMITS.registryBytes)
+      throw new Error("Invalid or oversized store registry.");
+    const state = JSON.parse(await readFile(statePath, "utf8")) as StoreState;
+    await this.validateState(state);
+    for (const category of ["backup", "temp"] as const) {
+      state.policies[category] = {
+        ...state.policies[category],
+        ...settings.policies?.[category],
+      };
+      validatePolicy(state.policies[category]);
+    }
+    return state;
+  }
+  private async readSnapshot(): Promise<StoreState | undefined> {
+    const settings = this.settings();
+    if (!(await this.ensureRootDirectory(false))) return undefined;
+    const markerPath = path.join(this.root, marker);
+    const statePath = path.join(this.root, "state.json");
+    if (!(await exists(markerPath)) || !(await exists(statePath)))
+      return undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await mkdir(lock, { mode: 0o700 });
-        break;
+        return await this.readAndValidateState(settings);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if (Date.now() >= deadline)
-          throw new Error(
-            `Managed store is locked: ${lock}. Never auto-remove a possibly live lock; inspect other Pi sessions first.`,
+        const code = (error as NodeJS.ErrnoException).code;
+        const msg = errorMessage(error);
+        const transient =
+          code === "ENOENT" ||
+          code === "EPERM" ||
+          code === "EBUSY" ||
+          msg.startsWith("Unregistered managed directory ");
+        if (attempt < 2 && transient) {
+          await delay(25);
+          continue;
+        }
+        if (msg.startsWith("Unregistered managed directory "))
+          return this.transaction(
+            async (state) => structuredClone(state),
+            false,
           );
-        await delay(25);
+        throw error;
       }
     }
-    try {
-      await writeFile(
-        path.join(lock, "owner.json"),
-        JSON.stringify({
-          pid: process.pid,
-          startedAt: new Date().toISOString(),
-        }),
-        { flag: "wx", mode: 0o600 },
-      );
+    return undefined;
+  }
+  private async transaction<T>(
+    fn: (state: StoreState, save: () => Promise<void>) => Promise<T>,
+    initialize = true,
+    options: {
+      operation?: string;
+      waitMs?: number;
+      signal?: AbortSignal;
+      sessionId?: string;
+    } = {},
+  ): Promise<T | undefined> {
+    const settings = this.settings();
+    if (!(await this.ensureRootDirectory(initialize))) return undefined;
+    const lock = path.join(this.root, ".lock");
+    const waitMs = options.waitMs ?? this.lockWaitMs(settings);
+    const lockOptions = {
+      lockPath: lock,
+      operation: options.operation ?? "managed:transaction",
+      waitMs,
+      sessionId: options.sessionId ?? this.defaultSession?.sessionId,
+      signal: options.signal,
+      autoReclaimStale: this.autoReclaimStale(settings),
+      canReclaimStale: () => this.canReclaimStoreLock(),
+      onStaleReclaimed: ({
+        owner,
+        reason,
+      }: {
+        lockPath: string;
+        owner?: LockOwner;
+        reason: string;
+      }) => {
+        console.warn(
+          `[pi-file-tools] Reclaimed stale store lock (${reason}): ${formatLockDiagnostics(lock, owner)}`,
+        );
+      },
+      busyMessage: (lockPath: string, owner?: LockOwner) =>
+        `Managed store is locked: ${formatLockDiagnostics(lockPath, owner)}. Never auto-remove a possibly live lock; inspect other Pi sessions first.`,
+    };
+    const runInsideLock = async (): Promise<T | undefined> => {
       const markerPath = path.join(this.root, marker);
       const statePath = path.join(this.root, "state.json");
       if (!(await exists(markerPath))) {
-        if ((await readdir(this.root)).some((name) => name !== ".lock"))
+        if (!initialize) return undefined;
+        if (
+          (await readdir(this.root)).some(
+            (name) =>
+              ![
+                ".lock",
+                ".maintenance.lock",
+                ".staging",
+                ".item-locks",
+                "sessions",
+              ].includes(name) &&
+              !name.startsWith(".lock-owner-") &&
+              !name.startsWith(".lock.stale-"),
+          )
+        )
           throw new Error(
             "Refusing to adopt a non-empty unmarked managed directory.",
           );
@@ -215,30 +396,51 @@ export class ManagedStore {
           lastSweep: 0,
         });
       }
-      if ((await readFile(markerPath, "utf8")) !== "pi-file-tools-managed-v1\n")
-        throw new Error("Unknown store marker; refusing to overwrite.");
-      await noLinks(statePath);
-      const file = await lstat(statePath);
-      if (!file.isFile() || file.size > MANAGED_LIMITS.registryBytes)
-        throw new Error("Invalid or oversized store registry.");
-      const state = JSON.parse(await readFile(statePath, "utf8")) as StoreState;
-      await this.validateState(state);
-      for (const category of ["backup", "temp"] as const) {
-        state.policies[category] = {
-          ...state.policies[category],
-          ...settings.policies?.[category],
-        };
-        validatePolicy(state.policies[category]);
-      }
+      const state = await this.readAndValidateState(settings);
       const save = () => this.atomic(statePath, state);
       return await fn(state, save);
-    } finally {
-      // Only remove this transaction's lock metadata, never user payloads.
-      const { unlink } = await import("node:fs/promises");
-      if (await exists(path.join(lock, "owner.json")))
-        await unlink(path.join(lock, "owner.json"));
-      await rmdir(lock);
-    }
+    };
+    return withFileLock(lockOptions, runInsideLock);
+  }
+  private async tryTransaction<T>(
+    fn: (state: StoreState, save: () => Promise<void>) => Promise<T>,
+    options: {
+      operation: string;
+      waitMs: number;
+      signal?: AbortSignal;
+      sessionId?: string;
+    },
+  ): Promise<{ acquired: true; value: T | undefined } | { acquired: false }> {
+    const settings = this.settings();
+    if (!(await this.ensureRootDirectory(false)))
+      return { acquired: true, value: undefined };
+    const lock = path.join(this.root, ".lock");
+    const attempt = await tryWithFileLock(
+      {
+        lockPath: lock,
+        operation: options.operation,
+        waitMs: options.waitMs,
+        sessionId: options.sessionId ?? this.defaultSession?.sessionId,
+        signal: options.signal,
+        autoReclaimStale: this.autoReclaimStale(settings),
+        canReclaimStale: () => this.canReclaimStoreLock(),
+        onStaleReclaimed: ({ owner, reason }) => {
+          console.warn(
+            `[pi-file-tools] Reclaimed stale store lock (${reason}): ${formatLockDiagnostics(lock, owner)}`,
+          );
+        },
+      },
+      async () => {
+        const markerPath = path.join(this.root, marker);
+        if (!(await exists(markerPath))) return undefined;
+        const state = await this.readAndValidateState(settings);
+        const statePath = path.join(this.root, "state.json");
+        const save = () => this.atomic(statePath, state);
+        return await fn(state, save);
+      },
+    );
+    if (!attempt.acquired) return { acquired: false };
+    return { acquired: true, value: attempt.value };
   }
   private async atomic(target: string, value: unknown): Promise<void> {
     const encoded = encodeRegistry(value);
@@ -291,7 +493,14 @@ export class ManagedStore {
         (item.lastVerifiedAt !== undefined &&
           !Number.isFinite(item.lastVerifiedAt)) ||
         (item.linkCount !== undefined &&
-          (!Number.isSafeInteger(item.linkCount) || item.linkCount < 0))
+          (!Number.isSafeInteger(item.linkCount) || item.linkCount < 0)) ||
+        (item.sessionId !== undefined &&
+          (typeof item.sessionId !== "string" || !item.sessionId)) ||
+        (item.sessionFile !== undefined &&
+          typeof item.sessionFile !== "string") ||
+        (item.pid !== undefined &&
+          (!Number.isSafeInteger(item.pid) || item.pid <= 0)) ||
+        (item.host !== undefined && typeof item.host !== "string")
       )
         throw new Error("Invalid inspection health metadata.");
       ids.add(item.id);
@@ -324,7 +533,11 @@ export class ManagedStore {
             `Unregistered managed directory ${name}; preserve and reconcile it before maintenance.`,
           );
   }
-  private async inspectItem(item: Item, signal?: AbortSignal): Promise<Tree> {
+  private async inspectItem(
+    item: Item,
+    signal?: AbortSignal,
+    hashFiles = item.category === "backup",
+  ): Promise<Tree> {
     try {
       await noLinks(item.path);
       const tree = await inspectTree(
@@ -332,6 +545,7 @@ export class ManagedStore {
         MANAGED_LIMITS.maxBytes,
         signal,
         item.category === "temp" ? "opaque" : "reject",
+        hashFiles,
       );
       if (item.category === "backup" && tree.digest !== item.digest)
         throw new Error(
@@ -348,10 +562,48 @@ export class ManagedStore {
       throw error;
     }
   }
-  private async refresh(
+  private async preInspectCategory(
     state: StoreState,
     category: Category,
+    signal?: AbortSignal,
+  ): Promise<{ startedAt: number; results: Map<string, PreInspection> }> {
+    const startedAt = this.now();
+    const results = new Map<string, PreInspection>();
+    const hashFiles = category === "backup";
+    for (const item of state.items.filter(
+      (i) => i.state === "active" && i.category === category,
+    )) {
+      checkAbort(signal);
+      try {
+        await noLinks(item.path);
+        const tree = await inspectTree(
+          item.path,
+          MANAGED_LIMITS.maxBytes,
+          signal,
+          category === "temp" ? "opaque" : "reject",
+          hashFiles,
+        );
+        if (category === "backup" && tree.digest !== item.digest)
+          throw new Error(
+            `Backup integrity check failed: ${item.id}; no cleanup performed.`,
+          );
+        results.set(item.id, { ok: true, tree, verifiedAt: this.now() });
+      } catch (error) {
+        checkAbort(signal);
+        results.set(item.id, {
+          ok: false,
+          error: errorMessage(error).slice(0, 2000),
+        });
+      }
+    }
+    return { startedAt, results };
+  }
+  private async applyPreInspection(
+    state: StoreState,
+    category: Category,
+    pre: { startedAt: number; results: Map<string, PreInspection> } | undefined,
     owner?: string,
+    activeSessionIds?: ReadonlySet<string>,
     signal?: AbortSignal,
   ): Promise<{ id: string; error: string }[]> {
     const failed: { id: string; error: string }[] = [];
@@ -359,13 +611,35 @@ export class ManagedStore {
     for (const item of state.items.filter(
       (i) => i.state === "active" && i.category === category,
     )) {
+      const cached = pre?.results.get(item.id);
+      if (pre && cached && (item.lastVerifiedAt ?? 0) <= pre.startedAt) {
+        if (cached.ok) {
+          item.bytes = cached.tree.bytes;
+          item.linkCount = cached.tree.linkCount;
+          item.lastVerifiedAt = cached.verifiedAt;
+          delete item.inspectionError;
+          if (
+            item.category === "temp" &&
+            ((owner && item.owner === owner && item.leaseUntil > now) ||
+              (item.sessionId !== undefined &&
+                activeSessionIds?.has(item.sessionId) === true &&
+                item.expiresAt > now))
+          )
+            item.leaseUntil = now + LEASE_MS;
+        } else {
+          item.inspectionError = cached.error;
+          failed.push({ id: item.id, error: cached.error });
+        }
+        continue;
+      }
       try {
-        await this.inspectItem(item, signal);
+        await this.inspectItem(item, signal, category === "backup");
         if (
           item.category === "temp" &&
-          owner &&
-          item.owner === owner &&
-          item.leaseUntil > now
+          ((owner && item.owner === owner && item.leaseUntil > now) ||
+            (item.sessionId !== undefined &&
+              activeSessionIds?.has(item.sessionId) === true &&
+              item.expiresAt > now))
         )
           item.leaseUntil = now + LEASE_MS;
       } catch (error) {
@@ -382,6 +656,8 @@ export class ManagedStore {
     cwd: string,
     signal?: AbortSignal,
   ): Promise<void> {
+    if (!tree.hashed)
+      throw new Error("Restore verification requires a content digest.");
     const links = item.category === "temp" ? "opaque" : "reject";
     await this.files.transfer(
       "copy",
@@ -392,8 +668,15 @@ export class ManagedStore {
         copyTree(source, target, tree, copySignal, links),
     );
     if (
-      (await inspectTree(destination, MANAGED_LIMITS.maxBytes, signal, links))
-        .digest !== tree.digest
+      (
+        await inspectTree(
+          destination,
+          MANAGED_LIMITS.maxBytes,
+          signal,
+          links,
+          true,
+        )
+      ).digest !== tree.digest
     )
       throw new Error(
         `Restore verification failed; preserve destination ${destination}.`,
@@ -405,7 +688,7 @@ export class ManagedStore {
         category === "backup"
           ? ["path", "purpose", "ttlHours", "pinned"]
           : ["name", "kind", "content", "purpose", "ttlHours", "pinned"],
-      list: ["offset", "limit"],
+      list: ["offset", "limit", "scope"],
       inspect: ["id"],
       restore: ["id", "destination"],
       release: ["id", "execute"],
@@ -421,6 +704,11 @@ export class ManagedStore {
         throw new Error(
           `Parameter ${key} does not apply to ${category} ${input.action}.`,
         );
+    if (
+      input.scope !== undefined &&
+      !["session", "project", "all"].includes(input.scope)
+    )
+      throw new Error("list scope must be session, project, or all.");
     if (
       input.ttlHours !== undefined &&
       (!Number.isFinite(input.ttlHours) ||
@@ -443,29 +731,47 @@ export class ManagedStore {
     return item;
   }
   private async recycle(
-    state: StoreState,
+    _state: StoreState,
     item: Item,
     save: () => Promise<void>,
-  ): Promise<void> {
-    await this.inspectItem(item);
-    item.state = "recycling";
-    await save();
+    options: { skipIfRestoring?: boolean } = {},
+  ): Promise<boolean> {
+    const itemLock = await tryAcquireFileLock({
+      lockPath: this.itemLockPath(item.id),
+      operation: `${item.category}:recycle`,
+      waitMs: 0,
+      autoReclaimStale: true,
+    });
+    if (!itemLock.acquired) {
+      if (options.skipIfRestoring) return false;
+      throw new Error(
+        `Item ${item.id} is currently being restored by another operation; retry after restore completes.`,
+      );
+    }
     try {
-      const result = await this.trash.put(item.path);
-      if (
-        pathKey(result.originalPath) !== pathKey(item.path) ||
-        (await exists(item.path))
-      )
-        throw new Error("OS recycle outcome uncertain.");
-      item.trashId = result.id;
-      item.recycledAt = this.now();
-      item.state = "recycled";
-      delete item.error;
+      await this.inspectItem(item, undefined, item.category === "backup");
+      item.state = "recycling";
       await save();
-    } catch (error) {
-      item.error = `Recycle outcome may be uncertain; inspect source and OS bin before retry: ${errorMessage(error)}`;
-      await save();
-      throw error;
+      try {
+        const result = await this.trash.put(item.path);
+        if (
+          pathKey(result.originalPath) !== pathKey(item.path) ||
+          (await exists(item.path))
+        )
+          throw new Error("OS recycle outcome uncertain.");
+        item.trashId = result.id;
+        item.recycledAt = this.now();
+        item.state = "recycled";
+        delete item.error;
+        await save();
+        return true;
+      } catch (error) {
+        item.error = `Recycle outcome may be uncertain; inspect source and OS bin before retry: ${errorMessage(error)}`;
+        await save();
+        throw error;
+      }
+    } finally {
+      await itemLock.handle.release();
     }
   }
   private async applyCleanup(
@@ -473,14 +779,20 @@ export class ManagedStore {
     category: Category,
     save: () => Promise<void>,
     inspectionFailures: { id: string; error: string }[] = [],
+    activeSessionIds?: ReadonlySet<string>,
+    maxActions = Number.POSITIVE_INFINITY,
   ): Promise<OperationResult> {
-    const plan = planCleanup(state, category, this.now());
+    const plan = planCleanup(state, category, this.now(), activeSessionIds);
     const released: string[] = [];
     const purged: string[] = [];
     const failed: { id: string; error: string }[] = [...inspectionFailures];
+    let actions = 0;
+    const selectedPurge = Number.isFinite(maxActions)
+      ? plan.purge.slice(0, Math.max(0, maxActions))
+      : plan.purge;
     // Validate every selected OS id against its original registered path before any purge.
-    const bin = plan.purge.length ? await this.trash.list() : [];
-    for (const row of plan.purge) {
+    const bin = selectedPurge.length ? await this.trash.list() : [];
+    for (const row of selectedPurge) {
       const item = this.find(state, category, row.id);
       const match = bin.find((i) => i.id === item.trashId);
       if (!match || pathKey(match.originalPath) !== pathKey(item.path))
@@ -489,17 +801,24 @@ export class ManagedStore {
         );
     }
     for (const row of plan.recycle) {
+      if (actions >= maxActions) break;
       const item = this.find(state, category, row.id);
       try {
-        await this.recycle(state, item, save);
-        released.push(item.id);
+        const didRecycle = await this.recycle(state, item, save, {
+          skipIfRestoring: Number.isFinite(maxActions),
+        });
+        if (didRecycle) {
+          released.push(item.id);
+          actions++;
+        }
       } catch (error) {
         failed.push({ id: item.id, error: errorMessage(error) });
         if (item.state !== "active") break;
         await save();
       }
     }
-    for (const row of plan.purge) {
+    for (const row of selectedPurge) {
+      if (actions >= maxActions) break;
       const item = this.find(state, category, row.id);
       item.state = "purging";
       await save();
@@ -514,6 +833,7 @@ export class ManagedStore {
         delete item.error;
         await save();
         purged.push(item.id);
+        actions++;
       } catch (error) {
         item.error = `Purge outcome uncertain: ${errorMessage(error)}`;
         await save();
@@ -531,40 +851,251 @@ export class ManagedStore {
       note: "Released items remain in OS trash until their recorded purge. Physical disk reclamation is not measured.",
     };
   }
-  async maintain(owner?: string): Promise<OperationResult> {
-    const result = await this.transaction(async (state, save) => {
-      const unresolved = state.items.filter(
-        (i) => !["active", "recycled", "purged"].includes(i.state),
-      );
-      if (unresolved.length)
-        throw new Error(
-          `Unresolved managed operations: ${unresolved.map((i) => i.id).join(", ")}; preserve evidence and inspect before maintenance.`,
+  private async cleanStaleStaging(): Promise<void> {
+    const now = Date.now();
+    try {
+      for (const name of await readdir(this.root)) {
+        if (!name.startsWith(".lock-owner-") || !name.endsWith(".tmp"))
+          continue;
+        const file = path.join(this.root, name);
+        const info = await lstat(file).catch(() => undefined);
+        if (info?.isFile() && now - info.mtimeMs > 60_000)
+          await rm(file, { force: true }).catch(() => undefined);
+      }
+    } catch {
+      // Ignore transient root listing errors.
+    }
+    const stagingRoot = path.join(this.root, ".staging");
+    if (!(await exists(stagingRoot))) return;
+    await noLinks(stagingRoot);
+    const entries = await readdir(stagingRoot);
+    for (const entry of entries) {
+      if (!entry.endsWith(".meta.json")) continue;
+      const metaPath = path.join(stagingRoot, entry);
+      const id = entry.slice(0, -".meta.json".length);
+      const payloadDir = path.join(stagingRoot, id);
+      try {
+        const meta = JSON.parse(
+          await readFile(metaPath, "utf8"),
+        ) as Partial<StagingMeta>;
+        if (
+          typeof meta.pid === "number" &&
+          typeof meta.processInstanceId === "string" &&
+          typeof meta.hostname === "string" &&
+          typeof meta.startedAtMs === "number" &&
+          isOwnerProvablyDead(
+            {
+              pid: meta.pid,
+              processInstanceId: meta.processInstanceId,
+              hostname: meta.hostname,
+              operation: "backup:staging",
+              startedAt: "",
+              startedAtMs: meta.startedAtMs,
+            },
+            now,
+            5000,
+          ).dead
+        ) {
+          if (await exists(payloadDir)) {
+            await noLinks(payloadDir);
+            await rm(payloadDir, { recursive: true, force: false });
+          }
+          await rm(metaPath, { force: true });
+        }
+      } catch {
+        // Ignore transient or active staging entries.
+      }
+    }
+  }
+  async touchSessionHeartbeat(session?: SessionIdentity): Promise<void> {
+    const effective = session ?? this.defaultSession;
+    if (!effective?.sessionId) return;
+    await touchSession(this.root, effective, this.now());
+  }
+  async endSession(sessionId?: string): Promise<void> {
+    const id = sessionId ?? this.defaultSession?.sessionId;
+    if (!id) return;
+    await removeSession(this.root, id);
+  }
+  async maintain(
+    owner?: string,
+    options: MaintainOptions = {},
+  ): Promise<OperationResult> {
+    const settings = this.settings();
+    checkAbort(options.signal);
+    if (!(await this.ensureRootDirectory(false)))
+      return { root: this.root, initialized: false };
+    const markerPath = path.join(this.root, marker);
+    if (!(await exists(markerPath)))
+      return { root: this.root, initialized: false };
+
+    const runSweep = async (): Promise<OperationResult> => {
+      const snapshot = await this.readSnapshot();
+      if (!snapshot) return { root: this.root, initialized: false };
+
+      const now = this.now();
+      const cooldownMs = this.sweepCooldownMs(settings);
+      if (options.background && cooldownMs > 0 && snapshot.lastSweep > 0) {
+        const hasUnresolved = snapshot.items.some((i) =>
+          UNRESOLVED_STATES.includes(i.state),
         );
-      const backupFailures = await this.refresh(state, "backup", owner);
-      const tempFailures = await this.refresh(state, "temp", owner);
-      await save();
-      const backup = await this.applyCleanup(
-        state,
+        const hasInspectionErrors = snapshot.items.some(
+          (i) => i.state === "active" && i.inspectionError !== undefined,
+        );
+        const activeSessions = await readActiveSessions(this.root, now);
+        const backupPlan = planCleanup(snapshot, "backup", now, activeSessions);
+        const tempPlan = planCleanup(snapshot, "temp", now, activeSessions);
+        const hasDueWork =
+          backupPlan.recycle.length > 0 ||
+          backupPlan.purge.length > 0 ||
+          tempPlan.recycle.length > 0 ||
+          tempPlan.purge.length > 0 ||
+          backupPlan.overBudget ||
+          tempPlan.overBudget;
+        if (
+          !hasUnresolved &&
+          !hasInspectionErrors &&
+          !hasDueWork &&
+          now - snapshot.lastSweep < cooldownMs
+        )
+          return {
+            root: this.root,
+            skipped: true,
+            reason: "recent-sweep",
+            lastSweep: snapshot.lastSweep,
+          };
+      }
+
+      await this.cleanStaleStaging();
+      const activeSessionIds = await readActiveSessions(this.root, now);
+      const backupPre = await this.preInspectCategory(
+        snapshot,
         "backup",
-        save,
-        backupFailures,
+        options.signal,
       );
-      const temp = await this.applyCleanup(state, "temp", save, tempFailures);
-      state.lastSweep = this.now();
-      await save();
-      const failed = [
-        ...(backup.failed as unknown[]),
-        ...(temp.failed as unknown[]),
-      ];
-      return {
-        root: this.root,
-        status: failed.length ? "partial" : "ok",
-        failed,
-        backup,
-        temp,
+      const tempPre = await this.preInspectCategory(
+        snapshot,
+        "temp",
+        options.signal,
+      );
+
+      const commit = async (
+        state: StoreState,
+        save: () => Promise<void>,
+      ): Promise<OperationResult> => {
+        const stillUnresolved = state.items.filter((i) =>
+          UNRESOLVED_STATES.includes(i.state),
+        );
+        if (stillUnresolved.length)
+          throw new Error(
+            `Unresolved managed operations: ${stillUnresolved.map((i) => i.id).join(", ")}; preserve evidence and inspect before maintenance.`,
+          );
+        const backupFailures = await this.applyPreInspection(
+          state,
+          "backup",
+          backupPre,
+          owner,
+          activeSessionIds,
+          options.signal,
+        );
+        const tempFailures = await this.applyPreInspection(
+          state,
+          "temp",
+          tempPre,
+          owner,
+          activeSessionIds,
+          options.signal,
+        );
+        await save();
+        const maxActions = options.maxActions ?? Number.POSITIVE_INFINITY;
+        const backup = await this.applyCleanup(
+          state,
+          "backup",
+          save,
+          backupFailures,
+          activeSessionIds,
+          maxActions,
+        );
+        const remaining = Number.isFinite(maxActions)
+          ? Math.max(
+              0,
+              maxActions -
+                ((backup.released as string[]).length +
+                  (backup.purged as string[]).length),
+            )
+          : Number.POSITIVE_INFINITY;
+        const temp = await this.applyCleanup(
+          state,
+          "temp",
+          save,
+          tempFailures,
+          activeSessionIds,
+          remaining,
+        );
+        const failed = [
+          ...(backup.failed as unknown[]),
+          ...(temp.failed as unknown[]),
+        ];
+        if (!failed.length) state.lastSweep = this.now();
+        await save();
+        const failedItems = state.items
+          .filter((i) => i.state === "failed")
+          .map((i) => ({
+            id: i.id,
+            category: i.category,
+            error: i.error ?? "failed",
+          }));
+        return {
+          root: this.root,
+          status: failed.length ? "partial" : "ok",
+          failed,
+          ...(failedItems.length ? { failedItems } : {}),
+          backup,
+          temp,
+        };
       };
-    }, false);
-    return result ?? { root: this.root, initialized: false };
+
+      if (options.background) {
+        const attempt = await this.tryTransaction(commit, {
+          operation: "managed:maintain:background",
+          waitMs: Math.min(this.lockWaitMs(settings), 1000),
+          signal: options.signal,
+          sessionId: options.session?.sessionId,
+        });
+        if (!attempt.acquired)
+          return { root: this.root, skipped: true, reason: "store-busy" };
+        return attempt.value ?? { root: this.root, initialized: false };
+      }
+      const result = await this.transaction(commit, false, {
+        operation: "managed:maintain",
+        signal: options.signal,
+        sessionId: options.session?.sessionId,
+      });
+      return result ?? { root: this.root, initialized: false };
+    };
+
+    if (options.background) {
+      const maintLock = await tryWithFileLock(
+        {
+          lockPath: path.join(this.root, ".maintenance.lock"),
+          operation: "managed:maintain:background",
+          waitMs: 0,
+          sessionId:
+            options.session?.sessionId ?? this.defaultSession?.sessionId,
+          signal: options.signal,
+          autoReclaimStale: this.autoReclaimStale(settings),
+        },
+        runSweep,
+      );
+      if (!maintLock.acquired)
+        return {
+          root: this.root,
+          skipped: true,
+          reason: "maintenance-in-progress",
+        };
+      return maintLock.value;
+    }
+    return runSweep();
   }
   async execute(
     category: Category,
@@ -572,6 +1103,7 @@ export class ManagedStore {
     cwd: string,
     owner = "manual",
     signal?: AbortSignal,
+    options: ExecuteOptions = {},
   ): Promise<OperationResult> {
     const { ttlHours, policy, ...rest } = rawInput;
     const input: NormalizedInput = {
@@ -583,149 +1115,253 @@ export class ManagedStore {
     };
     this.allowed(category, input);
     checkAbort(signal);
-    const result = await this.transaction(async (state, save) => {
-      if (input.action === "policy") {
-        const current = state.policies[category];
-        let proposed = { ...current, ...input.policy };
-        validatePolicy(proposed);
-        if (input.execute) {
-          if (this.settingsPath)
-            proposed = await savePolicy(
-              this.settingsPath,
-              category,
-              rawInput.policy ?? {},
-              current,
-            );
-          state.policies[category] = proposed;
-          await save();
+    const session = options.session ?? this.defaultSession;
+    if (session?.sessionId)
+      await touchSession(this.root, { ...session, cwd }, this.now()).catch(
+        () => undefined,
+      );
+
+    // Lock-free read path for list, inspect, and policy preview once the store exists.
+    if (
+      input.action === "list" ||
+      input.action === "inspect" ||
+      (input.action === "policy" && !input.execute)
+    ) {
+      const snapshot = await this.readSnapshot();
+      if (snapshot) {
+        if (input.action === "policy") {
+          const current = snapshot.policies[category];
+          const proposed = { ...current, ...input.policy };
+          validatePolicy(proposed);
+          return {
+            category,
+            root: this.root,
+            settingsPath: this.settingsPath ?? null,
+            current,
+            proposed,
+            applied: false,
+          };
         }
-        return {
-          category,
-          root: this.root,
-          settingsPath: this.settingsPath ?? null,
-          current,
-          proposed,
-          applied: !!input.execute,
-        };
-      }
-      if (input.action === "list") {
-        const offset = input.offset ?? 0;
-        const limit = input.limit ?? 100;
-        if (
-          !Number.isInteger(offset) ||
-          offset < 0 ||
-          !Number.isInteger(limit) ||
-          limit < 1 ||
-          limit > 200
-        )
-          throw new Error("List offset/limit invalid (limit 1..200).");
-        const items = state.items
-          .filter((i) => i.category === category)
-          .sort((a, b) => b.createdAt - a.createdAt);
-        return {
-          root: this.root,
-          policy: state.policies[category],
-          total: items.length,
-          items: items.slice(offset, offset + limit),
-          nextOffset: offset + limit < items.length ? offset + limit : null,
-        };
-      }
-      if (input.action === "inspect")
-        return { item: this.find(state, category, input.id), root: this.root };
-      if (input.action === "pin") {
-        if (typeof input.pinned !== "boolean")
-          throw new Error("pin requires pinned:true/false.");
-        const item = this.find(state, category, input.id);
-        if (!["active", "recycled"].includes(item.state))
-          throw new Error("Only settled items may be pinned.");
-        item.pinned = input.pinned;
-        await save();
-        return { item };
-      }
-      if (
-        state.items.some(
-          (i) => !["active", "recycled", "purged"].includes(i.state),
-        )
-      )
-        throw new Error(
-          "Unresolved managed operation blocks mutation. Use list/inspect; do not reset the registry.",
-        );
-      checkAbort(signal);
-      if (input.action === "cleanup") {
-        const failures = await this.refresh(state, category, undefined, signal);
-        const plan = planCleanup(state, category, this.now());
-        if (!input.execute)
+        if (input.action === "list") {
+          const offset = input.offset ?? 0;
+          const limit = input.limit ?? 100;
+          if (
+            !Number.isInteger(offset) ||
+            offset < 0 ||
+            !Number.isInteger(limit) ||
+            limit < 1 ||
+            limit > 200
+          )
+            throw new Error("List offset/limit invalid (limit 1..200).");
+          const scope = input.scope ?? "all";
+          const projectKey = pathKey(path.resolve(cwd));
+          const items = snapshot.items
+            .filter((i) => {
+              if (i.category !== category) return false;
+              if (scope === "session")
+                return (
+                  session?.sessionId !== undefined &&
+                  i.sessionId === session.sessionId
+                );
+              if (scope === "project") return pathKey(i.project) === projectKey;
+              return true;
+            })
+            .sort((a, b) => b.createdAt - a.createdAt);
           return {
             root: this.root,
-            plan,
-            applied: false,
-            failed: failures,
-            status: failures.length ? "partial" : "ok",
+            policy: snapshot.policies[category],
+            scope,
+            currentSessionId: session?.sessionId ?? null,
+            total: items.length,
+            items: items.slice(offset, offset + limit),
+            nextOffset: offset + limit < items.length ? offset + limit : null,
           };
-        await save();
+        }
         return {
+          item: this.find(snapshot, category, input.id),
           root: this.root,
-          applied: true,
-          ...(await this.applyCleanup(state, category, save, failures)),
         };
       }
-      if (input.action === "touch") {
-        const item = this.find(state, category, input.id);
-        if (item.state !== "active")
-          throw new Error("Only active items may be renewed.");
-        await noLinks(item.path);
-        if (!(await exists(item.path)))
-          throw new Error("Cannot renew a missing managed item.");
-        item.expiresAt =
-          this.now() +
-          (input.ttlHours ?? state.policies[category].ttlHours) * 3600000;
-        if (category === "temp") {
-          item.owner = owner;
-          item.leaseUntil = this.now() + LEASE_MS;
-        }
-        await save();
-        return { item };
-      }
-      if (input.action === "release") {
-        const item = this.find(state, category, input.id);
-        if (item.state !== "active")
-          throw new Error("Only active items may be released.");
-        if (item.pinned) throw new Error("Unpin the item before releasing it.");
-        try {
-          await this.inspectItem(item, signal);
-        } catch (error) {
-          checkAbort(signal);
-          await save();
+    }
+
+    if (input.action === "restore") {
+      return this.executeRestore(category, input, cwd, signal, session);
+    }
+
+    if (input.action === "create" && category === "backup") {
+      return this.executeBackupCreate(input, cwd, owner, signal, session);
+    }
+
+    if (input.action === "create") {
+      const purpose = input.purpose?.trim();
+      if (!purpose || purpose.length > 500 || hasControlCharacters(purpose))
+        throw new Error(
+          "create requires a purpose (1..500 readable characters).",
+        );
+      const name =
+        input.name ?? (input.kind === "directory" ? "scratch" : "scratch.tmp");
+      if (path.basename(name) !== name || name === "." || name === "..")
+        throw new Error("name must be one basename, never a path.");
+      resolvePath(name, this.root);
+      if (input.kind === "directory" && input.content !== undefined)
+        throw new Error("Directory temp cannot have content.");
+      if ((input.content?.length ?? 0) > 1024 * 1024)
+        throw new Error("Initial temp content exceeds 1 MiB characters.");
+    }
+    const pre =
+      input.action === "cleanup" || input.action === "create"
+        ? await (async () => {
+            const snapshot = await this.readSnapshot();
+            if (!snapshot) return undefined;
+            return this.preInspectCategory(snapshot, category, signal);
+          })()
+        : undefined;
+
+    const result = await this.transaction(
+      async (state, save) => {
+        if (input.action === "policy") {
+          const current = state.policies[category];
+          let proposed = { ...current, ...input.policy };
+          validatePolicy(proposed);
+          if (input.execute) {
+            if (this.settingsPath)
+              proposed = await savePolicy(
+                this.settingsPath,
+                category,
+                rawInput.policy ?? {},
+                current,
+              );
+            state.policies[category] = proposed;
+            await save();
+          }
           return {
-            item,
-            applied: false,
-            status: "blocked",
-            failed: [{ id: item.id, error: errorMessage(error) }],
+            category,
+            root: this.root,
+            settingsPath: this.settingsPath ?? null,
+            current,
+            proposed,
+            applied: !!input.execute,
           };
         }
-        if (!input.execute)
-          return { item, applied: false, destination: "OS recycle bin" };
-        checkAbort(signal);
-        await this.recycle(state, item, save);
-        return { item, applied: true };
-      }
-      if (input.action === "restore") {
-        const item = this.find(state, category, input.id);
-        if (!["active", "recycled"].includes(item.state))
-          throw new Error("Item cannot be restored in this state.");
-        const destination = resolvePath(
-          input.destination ?? item.originalPath,
-          cwd,
-        );
-        await this.outside(destination);
-        if (await exists(destination))
+        if (input.action === "list") {
+          const offset = input.offset ?? 0;
+          const limit = input.limit ?? 100;
+          if (
+            !Number.isInteger(offset) ||
+            offset < 0 ||
+            !Number.isInteger(limit) ||
+            limit < 1 ||
+            limit > 200
+          )
+            throw new Error("List offset/limit invalid (limit 1..200).");
+          const scope = input.scope ?? "all";
+          const projectKey = pathKey(path.resolve(cwd));
+          const items = state.items
+            .filter((i) => {
+              if (i.category !== category) return false;
+              if (scope === "session")
+                return (
+                  session?.sessionId !== undefined &&
+                  i.sessionId === session.sessionId
+                );
+              if (scope === "project") return pathKey(i.project) === projectKey;
+              return true;
+            })
+            .sort((a, b) => b.createdAt - a.createdAt);
+          return {
+            root: this.root,
+            policy: state.policies[category],
+            scope,
+            currentSessionId: session?.sessionId ?? null,
+            total: items.length,
+            items: items.slice(offset, offset + limit),
+            nextOffset: offset + limit < items.length ? offset + limit : null,
+          };
+        }
+        if (input.action === "inspect")
+          return {
+            item: this.find(state, category, input.id),
+            root: this.root,
+          };
+        if (input.action === "pin") {
+          if (typeof input.pinned !== "boolean")
+            throw new Error("pin requires pinned:true/false.");
+          const item = this.find(state, category, input.id);
+          if (!["active", "recycled"].includes(item.state))
+            throw new Error("Only settled items may be pinned.");
+          item.pinned = input.pinned;
+          await save();
+          return { item };
+        }
+        if (state.items.some((i) => UNRESOLVED_STATES.includes(i.state)))
           throw new Error(
-            "Restore destination already exists; choose another path.",
+            "Unresolved managed operation blocks mutation. Use list/inspect; do not reset the registry.",
           );
-        if (item.state === "active") {
-          let tree: Tree;
+        checkAbort(signal);
+        const activeSessionIds = await readActiveSessions(
+          this.root,
+          this.now(),
+        );
+        if (input.action === "cleanup") {
+          const failures = await this.applyPreInspection(
+            state,
+            category,
+            pre,
+            undefined,
+            activeSessionIds,
+            signal,
+          );
+          const plan = planCleanup(
+            state,
+            category,
+            this.now(),
+            activeSessionIds,
+          );
+          if (!input.execute)
+            return {
+              root: this.root,
+              plan,
+              applied: false,
+              failed: failures,
+              status: failures.length ? "partial" : "ok",
+            };
+          await save();
+          return {
+            root: this.root,
+            applied: true,
+            ...(await this.applyCleanup(
+              state,
+              category,
+              save,
+              failures,
+              activeSessionIds,
+            )),
+          };
+        }
+        if (input.action === "touch") {
+          const item = this.find(state, category, input.id);
+          if (item.state !== "active")
+            throw new Error("Only active items may be renewed.");
+          await noLinks(item.path);
+          if (!(await exists(item.path)))
+            throw new Error("Cannot renew a missing managed item.");
+          item.expiresAt =
+            this.now() +
+            (input.ttlHours ?? state.policies[category].ttlHours) * 3600000;
+          if (category === "temp") {
+            item.owner = owner;
+            item.leaseUntil = this.now() + LEASE_MS;
+            if (session?.sessionId) item.sessionId = session.sessionId;
+          }
+          await save();
+          return { item };
+        }
+        if (input.action === "release") {
+          const item = this.find(state, category, input.id);
+          if (item.state !== "active")
+            throw new Error("Only active items may be released.");
           try {
-            tree = await this.inspectItem(item, signal);
+            await this.inspectItem(item, signal, category === "backup");
           } catch (error) {
             checkAbort(signal);
             await save();
@@ -736,202 +1372,520 @@ export class ManagedStore {
               failed: [{ id: item.id, error: errorMessage(error) }],
             };
           }
-          await this.copyOut(item, tree, destination, cwd, signal);
-          await save();
-          return {
-            item,
-            destination,
-            verifiedDigest: tree.digest,
-            consumed: false,
-          };
+          if (!input.execute)
+            return { item, applied: false, destination: "OS recycle bin" };
+          await this.recycle(state, item, save);
+          return { item, applied: true };
         }
-        const bin = (await this.trash.list()).find(
-          (i) => i.id === item.trashId,
-        );
-        if (!bin || pathKey(bin.originalPath) !== pathKey(item.path))
-          throw new Error("Recycled identity changed; no restore attempted.");
-        // Recover into the registered path first, never trust unchecked OS-bin contents as a backup.
-        item.state = "creating";
-        await save();
-        const recovery = await this.trash.restore(
-          item.trashId as string,
-          item.path,
-        );
-        if (
-          pathKey(recovery.destination) !== pathKey(item.path) ||
-          !(await exists(item.path))
-        )
+        if (state.items.length >= MANAGED_LIMITS.registryItems)
           throw new Error(
-            "Restore outcome differs from its registered path; inspect source and OS bin before retry.",
+            `Registry reached ${MANAGED_LIMITS.registryItems} receipts; archive the store before adding items.`,
           );
-        item.state = "active";
-        delete item.trashId;
-        delete item.recycledAt;
-        item.expiresAt =
-          this.now() + state.policies[category].ttlHours * 3600000;
-        item.inspectionError = "Recovered item awaits inspection.";
-        await save();
-        let tree: Tree;
-        try {
-          tree = await this.inspectItem(item, signal);
-        } catch (error) {
-          checkAbort(signal);
-          await save();
-          return {
-            item,
-            applied: false,
-            recoveredToManagedPath: true,
-            recoveredPath: item.path,
-            destinationRequested: destination,
-            status: "blocked",
-            failed: [{ id: item.id, error: errorMessage(error) }],
-          };
-        }
-        await save();
-        await this.copyOut(item, tree, destination, cwd, signal);
-        return {
-          item,
-          destination,
-          verifiedDigest: tree.digest,
-          consumed: false,
-        };
-      }
-      if (state.items.length >= MANAGED_LIMITS.registryItems)
-        throw new Error(
-          `Registry reached ${MANAGED_LIMITS.registryItems} receipts; archive the store before adding items.`,
-        );
-      const purpose = input.purpose?.trim();
-      if (!purpose || purpose.length > 500 || hasControlCharacters(purpose))
-        throw new Error(
-          "create requires a purpose (1..500 readable characters).",
-        );
-      let originalPath: string | undefined;
-      let sourceTree: Awaited<ReturnType<typeof inspectTree>> | undefined;
-      let name =
-        input.name ?? (input.kind === "directory" ? "scratch" : "scratch.tmp");
-      if (category === "backup") {
-        originalPath = resolvePath(input.path, cwd);
-        if (pathKey(originalPath) === pathKey(path.parse(originalPath).root))
-          throw new Error("Refusing to snapshot a filesystem root.");
-        await this.outside(originalPath);
-        sourceTree = await inspectTree(
-          originalPath,
-          state.policies[category].maxBytes,
+        const purpose = input.purpose?.trim();
+        if (!purpose || purpose.length > 500 || hasControlCharacters(purpose))
+          throw new Error(
+            "create requires a purpose (1..500 readable characters).",
+          );
+        const name =
+          input.name ??
+          (input.kind === "directory" ? "scratch" : "scratch.tmp");
+        if (path.basename(name) !== name || name === "." || name === "..")
+          throw new Error("name must be one basename, never a path.");
+        resolvePath(name, this.root);
+        if (input.kind === "directory" && input.content !== undefined)
+          throw new Error("Directory temp cannot have content.");
+        if ((input.content?.length ?? 0) > 1024 * 1024)
+          throw new Error("Initial temp content exceeds 1 MiB characters.");
+        const bytes = Buffer.byteLength(input.content ?? "");
+        const policy = state.policies[category];
+        if (bytes > policy.maxBytes)
+          throw new Error("New item exceeds managed byte quota.");
+        const failures = await this.applyPreInspection(
+          state,
+          category,
+          pre,
+          undefined,
+          activeSessionIds,
           signal,
         );
-        name = path.basename(originalPath);
-      }
-      if (path.basename(name) !== name || name === "." || name === "..")
-        throw new Error("name must be one basename, never a path.");
-      resolvePath(name, this.root);
-      if (
-        category === "temp" &&
-        input.kind === "directory" &&
-        input.content !== undefined
-      )
-        throw new Error("Directory temp cannot have content.");
-      if ((input.content?.length ?? 0) > 1024 * 1024)
-        throw new Error("Initial temp content exceeds 1 MiB characters.");
-      const bytes = sourceTree?.bytes ?? Buffer.byteLength(input.content ?? "");
-      const policy = state.policies[category];
-      if (bytes > policy.maxBytes)
-        throw new Error("New item exceeds managed byte quota.");
-      const failures = await this.refresh(state, category, undefined, signal);
-      if (failures.length) {
-        await save();
-        throw new Error(
-          `Cannot admit ${category}: unverified usage for ${failures.map((i) => i.id).join(", ")}. Inspect those items; unknown bytes are not zero.`,
+        if (failures.length) {
+          await save();
+          throw new Error(
+            `Cannot admit ${category}: unverified usage for ${failures.map((i) => i.id).join(", ")}. Inspect those items; unknown bytes are not zero.`,
+          );
+        }
+        const id = `${category}-${randomUUID()}`;
+        const item: Item = {
+          id,
+          category,
+          name,
+          path: path.join(this.root, category, id, name),
+          kind: input.kind ?? "file",
+          project: path.resolve(cwd),
+          purpose,
+          owner,
+          ...(session?.sessionId ? { sessionId: session.sessionId } : {}),
+          ...(session?.sessionFile ? { sessionFile: session.sessionFile } : {}),
+          pid: process.pid,
+          host: hostname(),
+          createdAt: this.now(),
+          expiresAt: this.now() + (input.ttlHours ?? policy.ttlHours) * 3600000,
+          leaseUntil: this.now() + LEASE_MS,
+          pinned: input.pinned ?? false,
+          bytes,
+          lastVerifiedAt: this.now(),
+          state: "creating",
+        };
+        // Forecast eviction before writing new content. The proposed item is never itself evicted.
+        const forecast: StoreState = {
+          ...state,
+          items: [...state.items, { ...item, state: "active", pinned: true }],
+        };
+        const plan = planCleanup(
+          forecast,
+          category,
+          this.now(),
+          activeSessionIds,
         );
-      }
-      const id = `${category}-${randomUUID()}`;
-      const item: Item = {
-        id,
-        category,
-        name,
-        path: path.join(this.root, category, id, name),
-        kind: sourceTree?.kind ?? input.kind ?? "file",
-        ...(originalPath ? { originalPath } : {}),
-        project: path.resolve(cwd),
-        purpose,
-        owner,
-        createdAt: this.now(),
-        expiresAt: this.now() + (input.ttlHours ?? policy.ttlHours) * 3600000,
-        leaseUntil: category === "temp" ? this.now() + LEASE_MS : 0,
-        pinned: input.pinned ?? false,
-        bytes,
-        state: "creating",
-      };
-      // Forecast eviction before writing new content. The proposed item is never itself evicted.
-      const forecast: StoreState = {
-        ...state,
-        items: [...state.items, { ...item, state: "active", pinned: true }],
-      };
-      const plan = planCleanup(forecast, category, this.now());
-      if (plan.overBudget)
-        throw new Error(
-          "Quota cannot admit this item while pins/leases or recovery-window bytes are protected. Release items or increase policy.",
-        );
-      for (const row of plan.recycle)
-        await this.recycle(state, this.find(state, category, row.id), save);
-      state.items.push(item);
-      await save();
-      await mkdir(path.dirname(item.path), { mode: 0o700 });
-      try {
-        if (originalPath && sourceTree) {
-          await locked(
-            [originalPath],
-            async () => {
-              await copyTree(
-                originalPath as string,
-                item.path,
-                sourceTree as NonNullable<typeof sourceTree>,
-                signal,
-              );
-              const copied = await inspectTree(
-                item.path,
-                policy.maxBytes,
-                signal,
-              );
-              const after = await inspectTree(
-                originalPath as string,
-                policy.maxBytes,
-                signal,
-              );
-              if (
-                copied.digest !== sourceTree?.digest ||
-                after.digest !== sourceTree?.digest
-              )
-                throw new Error(
-                  "Source changed or backup verification failed; partial payload retained.",
-                );
-              item.digest = copied.digest;
-            },
+        if (plan.overBudget)
+          throw new Error(
+            "Quota cannot admit this item while pins/leases or recovery-window bytes are protected. Release items or increase policy.",
+          );
+        for (const row of plan.recycle)
+          await this.recycle(state, this.find(state, category, row.id), save);
+        const itemDir = path.dirname(item.path);
+        await mkdir(itemDir, { mode: 0o700 });
+        try {
+          if (item.kind === "directory")
+            await mkdir(item.path, { mode: 0o700 });
+          else
+            await writeFile(item.path, input.content ?? "", {
+              flag: "wx",
+              mode: 0o600,
+            });
+          item.state = "active";
+          state.items.push(item);
+          await save();
+          return {
+            item,
+            root: this.root,
+            evicted: plan.recycle.map((i) => i.id),
+            policy,
+          };
+        } catch (error) {
+          await rm(itemDir, { recursive: true, force: true }).catch(
+            () => undefined,
+          );
+          throw new Error(`Managed creation failed: ${errorMessage(error)}`);
+        }
+      },
+      true,
+      {
+        operation: `${category}:${input.action}`,
+        signal,
+        sessionId: session?.sessionId,
+      },
+    );
+    if (session?.sessionId)
+      await touchSession(this.root, { ...session, cwd }, this.now()).catch(
+        () => undefined,
+      );
+    return result as OperationResult;
+  }
+  private async executeBackupCreate(
+    input: NormalizedInput,
+    cwd: string,
+    owner: string,
+    signal?: AbortSignal,
+    session?: SessionIdentity,
+  ): Promise<OperationResult> {
+    const settings = this.settings();
+    const purpose = input.purpose?.trim();
+    if (!purpose || purpose.length > 500 || hasControlCharacters(purpose))
+      throw new Error(
+        "create requires a purpose (1..500 readable characters).",
+      );
+    const originalPath = resolvePath(input.path, cwd);
+    if (pathKey(originalPath) === pathKey(path.parse(originalPath).root))
+      throw new Error("Refusing to snapshot a filesystem root.");
+    await this.outside(originalPath);
+    const name = path.basename(originalPath);
+    if (path.basename(name) !== name || name === "." || name === "..")
+      throw new Error("name must be one basename, never a path.");
+    resolvePath(name, this.root);
+
+    // Ensure store exists before staging inside <root>/.staging.
+    if (!(await exists(path.join(this.root, marker))))
+      await this.transaction(async () => undefined, true, {
+        operation: "backup:init",
+        signal,
+        sessionId: session?.sessionId,
+      });
+
+    const snapshot = await this.readSnapshot();
+    const initialPolicy = snapshot?.policies.backup ?? {
+      ...DEFAULT_POLICIES.backup,
+      ...settings.policies?.backup,
+    };
+    const stagingRoot = path.join(this.root, ".staging");
+    await noLinks(stagingRoot);
+    await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+    const stagingId = randomUUID();
+    const stagingDir = path.join(stagingRoot, stagingId);
+    const metaPath = path.join(stagingRoot, `${stagingId}.meta.json`);
+    const meta: StagingMeta = {
+      pid: process.pid,
+      processInstanceId: CURRENT_PROCESS_INSTANCE_ID,
+      hostname: hostname(),
+      startedAtMs: Date.now(),
+    };
+    await writeFile(metaPath, JSON.stringify(meta), {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await mkdir(stagingDir, { mode: 0o700 });
+    const stagedPayload = path.join(stagingDir, name);
+
+    try {
+      let sourceTree!: Tree;
+      let copied!: Tree;
+      await locked(
+        [originalPath],
+        async () => {
+          sourceTree = await inspectTree(
+            originalPath,
+            initialPolicy.maxBytes,
+            signal,
+            "reject",
+            true,
+          );
+          await copyTree(originalPath, stagedPayload, sourceTree, signal);
+          copied = await inspectTree(
+            stagedPayload,
+            initialPolicy.maxBytes,
+            signal,
+            "reject",
+            true,
+          );
+          const after = await inspectTree(
+            originalPath,
+            initialPolicy.maxBytes,
+            signal,
+            "reject",
+            true,
+          );
+          if (
+            copied.digest !== sourceTree.digest ||
+            after.digest !== sourceTree.digest
+          )
+            throw new Error(
+              "Source changed or backup verification failed; partial payload retained.",
+            );
+        },
+        signal,
+      );
+
+      const preSnapshot = await this.readSnapshot();
+      const pre = preSnapshot
+        ? await this.preInspectCategory(preSnapshot, "backup", signal)
+        : undefined;
+
+      const committed = await this.transaction(
+        async (state, save) => {
+          if (state.items.some((i) => UNRESOLVED_STATES.includes(i.state)))
+            throw new Error(
+              "Unresolved managed operation blocks mutation. Use list/inspect; do not reset the registry.",
+            );
+          if (state.items.length >= MANAGED_LIMITS.registryItems)
+            throw new Error(
+              `Registry reached ${MANAGED_LIMITS.registryItems} receipts; archive the store before adding items.`,
+            );
+          const policy = state.policies.backup;
+          if (copied.bytes > policy.maxBytes)
+            throw new Error("New item exceeds managed byte quota.");
+          const activeSessionIds = await readActiveSessions(
+            this.root,
+            this.now(),
+          );
+          const failures = await this.applyPreInspection(
+            state,
+            "backup",
+            pre,
+            undefined,
+            activeSessionIds,
             signal,
           );
-        } else if (item.kind === "directory")
-          await mkdir(item.path, { mode: 0o700 });
-        else
-          await writeFile(item.path, input.content ?? "", {
-            flag: "wx",
-            mode: 0o600,
-          });
-        item.state = "active";
-        await save();
-        return {
-          item,
-          root: this.root,
-          evicted: plan.recycle.map((i) => i.id),
-          policy,
-        };
-      } catch (error) {
-        item.state = "failed";
-        item.error = errorMessage(error);
-        await save();
-        throw new Error(
-          `Managed creation failed; retained ${item.id} for inspection: ${item.error}`,
+          if (failures.length) {
+            await save();
+            throw new Error(
+              `Cannot admit backup: unverified usage for ${failures.map((i) => i.id).join(", ")}. Inspect those items; unknown bytes are not zero.`,
+            );
+          }
+          const id = `backup-${randomUUID()}`;
+          const item: Item = {
+            id,
+            category: "backup",
+            name,
+            path: path.join(this.root, "backup", id, name),
+            kind: sourceTree.kind,
+            originalPath,
+            project: path.resolve(cwd),
+            purpose,
+            owner,
+            ...(session?.sessionId ? { sessionId: session.sessionId } : {}),
+            ...(session?.sessionFile
+              ? { sessionFile: session.sessionFile }
+              : {}),
+            pid: process.pid,
+            host: hostname(),
+            createdAt: this.now(),
+            expiresAt:
+              this.now() + (input.ttlHours ?? policy.ttlHours) * 3600000,
+            leaseUntil: 0,
+            pinned: input.pinned ?? false,
+            bytes: copied.bytes,
+            digest: copied.digest,
+            linkCount: copied.linkCount,
+            lastVerifiedAt: this.now(),
+            state: "active",
+          };
+          const forecast: StoreState = {
+            ...state,
+            items: [...state.items, { ...item, state: "active", pinned: true }],
+          };
+          const plan = planCleanup(
+            forecast,
+            "backup",
+            this.now(),
+            activeSessionIds,
+          );
+          if (plan.overBudget)
+            throw new Error(
+              "Quota cannot admit this item while pins/leases or recovery-window bytes are protected. Release items or increase policy.",
+            );
+          for (const row of plan.recycle)
+            await this.recycle(state, this.find(state, "backup", row.id), save);
+          const itemDir = path.dirname(item.path);
+          await mkdir(itemDir, { mode: 0o700 });
+          try {
+            await rename(stagedPayload, item.path);
+          } catch (error) {
+            await rmdir(itemDir).catch(() => undefined);
+            throw error;
+          }
+          state.items.push(item);
+          try {
+            await save();
+          } catch (error) {
+            await rename(item.path, stagedPayload).catch(() => undefined);
+            await rmdir(itemDir).catch(() => undefined);
+            throw error;
+          }
+          return {
+            item,
+            root: this.root,
+            evicted: plan.recycle.map((i) => i.id),
+            policy,
+          };
+        },
+        true,
+        {
+          operation: "backup:create",
+          signal,
+          sessionId: session?.sessionId,
+        },
+      );
+      if (session?.sessionId)
+        await touchSession(this.root, { ...session, cwd }, this.now()).catch(
+          () => undefined,
         );
+      return committed as OperationResult;
+    } finally {
+      await rm(stagingDir, { recursive: true, force: true }).catch(
+        () => undefined,
+      );
+      await rm(metaPath, { force: true }).catch(() => undefined);
+    }
+  }
+  private async executeRestore(
+    category: Category,
+    input: NormalizedInput,
+    cwd: string,
+    signal?: AbortSignal,
+    session?: SessionIdentity,
+  ): Promise<OperationResult> {
+    const settings = this.settings();
+    const snapshot = await this.readSnapshot();
+    if (!snapshot) {
+      // Initialize or fail cleanly inside transaction if store doesn't exist yet.
+      await this.transaction(
+        async (state) => {
+          this.find(state, category, input.id);
+        },
+        true,
+        {
+          operation: `${category}:restore:check`,
+          signal,
+          sessionId: session?.sessionId,
+        },
+      );
+    } else {
+      this.find(snapshot, category, input.id);
+    }
+
+    const itemId = input.id as string;
+    let itemLock: LockHandle | undefined;
+    try {
+      itemLock = await acquireFileLock({
+        lockPath: this.itemLockPath(itemId),
+        operation: `${category}:restore`,
+        waitMs: this.lockWaitMs(settings),
+        sessionId: session?.sessionId,
+        signal,
+        autoReclaimStale: this.autoReclaimStale(settings),
+        busyMessage: (lockPath, owner) =>
+          `Managed item ${itemId} is busy: ${formatLockDiagnostics(lockPath, owner)}`,
+      });
+
+      const prep = (await this.transaction(
+        async (state, save) => {
+          if (state.items.some((i) => UNRESOLVED_STATES.includes(i.state)))
+            throw new Error(
+              "Unresolved managed operation blocks mutation. Use list/inspect; do not reset the registry.",
+            );
+          const item = this.find(state, category, itemId);
+          if (!["active", "recycled"].includes(item.state))
+            throw new Error("Item cannot be restored in this state.");
+          const destination = resolvePath(
+            input.destination ?? item.originalPath,
+            cwd,
+          );
+          await this.outside(destination);
+          if (await exists(destination))
+            throw new Error(
+              "Restore destination already exists; choose another path.",
+            );
+          if (item.state === "active") {
+            return {
+              item: structuredClone(item),
+              destination,
+              recoveredFromBin: false,
+            };
+          }
+          const bin = (await this.trash.list()).find(
+            (i) => i.id === item.trashId,
+          );
+          if (!bin || pathKey(bin.originalPath) !== pathKey(item.path))
+            throw new Error("Recycled identity changed; no restore attempted.");
+          // Recover into the registered path first, never trust unchecked OS-bin contents as a backup.
+          item.state = "creating";
+          await save();
+          const recovery = await this.trash.restore(
+            item.trashId as string,
+            item.path,
+          );
+          if (
+            pathKey(recovery.destination) !== pathKey(item.path) ||
+            !(await exists(item.path))
+          )
+            throw new Error(
+              "Restore outcome differs from its registered path; inspect source and OS bin before retry.",
+            );
+          item.state = "active";
+          delete item.trashId;
+          delete item.recycledAt;
+          item.expiresAt =
+            this.now() + state.policies[category].ttlHours * 3600000;
+          item.inspectionError = "Recovered item awaits inspection.";
+          await save();
+          return {
+            item: structuredClone(item),
+            destination,
+            recoveredFromBin: true,
+          };
+        },
+        true,
+        {
+          operation: `${category}:restore:prepare`,
+          signal,
+          sessionId: session?.sessionId,
+        },
+      )) as { item: Item; destination: string; recoveredFromBin: boolean };
+
+      // Inspect and copy out outside the global store lock while holding the per-item lock.
+      let tree: Tree;
+      try {
+        await noLinks(prep.item.path);
+        tree = await inspectTree(
+          prep.item.path,
+          MANAGED_LIMITS.maxBytes,
+          signal,
+          category === "temp" ? "opaque" : "reject",
+          true,
+        );
+        if (category === "backup" && tree.digest !== prep.item.digest)
+          throw new Error(
+            `Backup integrity check failed: ${prep.item.id}; no cleanup performed.`,
+          );
+      } catch (error) {
+        checkAbort(signal);
+        const msg = errorMessage(error).slice(0, 2000);
+        const blockedItem = (await this.transaction(
+          async (state, save) => {
+            const current = this.find(state, category, prep.item.id);
+            current.inspectionError = msg;
+            await save();
+            return structuredClone(current);
+          },
+          false,
+          {
+            operation: `${category}:restore:record-error`,
+            signal,
+            sessionId: session?.sessionId,
+          },
+        )) as Item;
+        return {
+          item: blockedItem,
+          applied: false,
+          ...(prep.recoveredFromBin
+            ? {
+                recoveredToManagedPath: true,
+                recoveredPath: prep.item.path,
+                destinationRequested: prep.destination,
+              }
+            : {}),
+          status: "blocked",
+          failed: [{ id: prep.item.id, error: msg }],
+        };
       }
-    });
-    return result as OperationResult;
+
+      const verifiedItem = (await this.transaction(
+        async (state, save) => {
+          const current = this.find(state, category, prep.item.id);
+          current.bytes = tree.bytes;
+          current.linkCount = tree.linkCount;
+          current.lastVerifiedAt = this.now();
+          delete current.inspectionError;
+          await save();
+          return structuredClone(current);
+        },
+        false,
+        {
+          operation: `${category}:restore:verify`,
+          signal,
+          sessionId: session?.sessionId,
+        },
+      )) as Item;
+
+      await this.copyOut(verifiedItem, tree, prep.destination, cwd, signal);
+      return {
+        item: verifiedItem,
+        destination: prep.destination,
+        verifiedDigest: tree.digest,
+        consumed: false,
+      };
+    } finally {
+      await itemLock?.release();
+    }
   }
 }

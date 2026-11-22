@@ -79,6 +79,13 @@ export function managedSchema(category: Category) {
       execute: Type.Optional(Type.Boolean()),
       offset: Type.Optional(Type.Integer({ minimum: 0 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+      scope: Type.Optional(
+        Type.String({
+          enum: ["session", "project", "all"],
+          description:
+            "Optional list filter: current Pi session, current local project cwd, or all items (default).",
+        }),
+      ),
       policy: Type.Optional(policySchema),
     },
     { additionalProperties: false },

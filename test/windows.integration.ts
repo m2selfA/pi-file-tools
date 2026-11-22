@@ -229,6 +229,26 @@ test("Windows native recycle/restore/selected-empty roundtrip", {
       await backend.restore(bb.id);
     });
     await check(
+      "concurrent WindowsTrash puts serialize via cross-process lock",
+      async () => {
+        const first = path.join(root, "concurrent-1.txt");
+        const second = path.join(root, "concurrent-2.txt");
+        await writeFile(first, "one");
+        await writeFile(second, "two");
+        const trashA = new WindowsTrash();
+        const trashB = new WindowsTrash();
+        const [itemA, itemB] = await Promise.all([
+          trashA.put(first),
+          trashB.put(second),
+        ]);
+        assert.notEqual(itemA.id, itemB.id);
+        await trashA.restore(itemA.id);
+        await trashB.restore(itemB.id);
+        assert.equal(await readFile(first, "utf8"), "one");
+        assert.equal(await readFile(second, "utf8"), "two");
+      },
+    );
+    await check(
       "missing source/id and unconfirmed empty are rejected",
       async () => {
         await assert.rejects(

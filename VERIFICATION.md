@@ -24,6 +24,10 @@ The official-loader smoke test invokes the actual registered `before_agent_start
 
 Local-scope wording is asserted for all six registered tool descriptions and the preflight section. The same loader rounds record `scopeVerified` after reading the loaded definitions. This is metadata and prompt-construction evidence, not a runtime path guard.
 
+## Multi-process and multi-session checks
+
+Unit and concurrency tests cover unhashed `temp` scans versus verified `restore`, lock-free reads under a held write lock, out-of-lock `backup` staging and `restore` item locks, live-lock owner diagnostics, safe stale-lock reclaim versus unresolved-state refusal, PID-reuse detection, background maintenance cooldown/try-lock skipping, session heartbeat protection, `list` `scope` filtering, non-blocking `session_start` cancellation, TUI-safe warning routing, and a six-process concurrent worker test. The Windows native suite also checks concurrent `WindowsTrash` puts through the cross-process trash lock.
+
 ## Evidence boundaries
 
 - The public summary is derived from local receipts. The private raw receipts are preserved separately and are not independently inspectable from this repository. No independent advisor approval is claimed.

@@ -1,6 +1,6 @@
 {
   "name": "@m2selfa/pi-file-tools",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "description": "Pi file tools with Windows/Linux trash, centralized backups and temporary resources",
   "type": "module",
   "private": true,

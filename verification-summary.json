@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "0.2.4",
+  "packageVersion": "0.3.0",
   "status": "passed-with-platform-gaps",
-  "verifiedAtUtc": "2026-11-22T03:28:48.073Z",
-  "sourceInputDigest": "fb923ef797558244476ba18925fac459b6e98eb1612dc735946722e63152e447",
+  "verifiedAtUtc": "2026-11-22T05:50:41.557Z",
+  "sourceInputDigest": "3ea92ac8bb13eeb2e849cc6f79a6c3c44ecaea4db5c5c569aa56b9da9cfa7620",
   "hashScope": "Files selected by scripts/source-state.ts; not a Git commit, binary or memory-image hash.",
   "environment": {
     "platform": "win32",
@@ -12,7 +12,7 @@
   },
   "results": {
     "unit": {
-      "passed": 89,
+      "passed": 100,
       "failed": 0
     },
     "officialLoader": {
@@ -29,7 +29,7 @@
       "callbackChecks": 4
     },
     "windowsNative": {
-      "checks": 10,
+      "checks": 11,
       "originalRecycleBinItemsPreserved": true
     },
     "actualSettingsLoader": {
@@ -88,6 +88,33 @@
       "pathParameterDescriptions": ["backup path", "restore destination"],
       "behaviorChange": "none",
       "scope": "Prompt and metadata only; not a runtime path interceptor. A remote path string that also exists locally can still be operated on."
+    },
+    "multiSession": {
+      "tempUnhashedRefresh": true,
+      "lockFreeReads": true,
+      "outOfLockBackupStaging": true,
+      "outOfLockRestoreWithItemLocks": true,
+      "inProcessLockQueue": true,
+      "atomicOwnerDiagnostics": true,
+      "safeStaleLockReclaim": true,
+      "unresolvedStateRefusesAutoReclaim": true,
+      "pidReuseDetection": true,
+      "nonBlockingStartupAndShutdownAbort": true,
+      "tuiSafeWarningRouting": true,
+      "backgroundMaintenanceCooldownAndTryLock": true,
+      "sessionHeartbeatProtection": true,
+      "listScopeFiltering": ["session", "project", "all"],
+      "failedItemIsolation": true,
+      "concurrentChildProcessesVerified": 6,
+      "crossProcessWindowsTrashLockVerified": true,
+      "realStoreReadonlyBench": {
+        "activeTempCount": 11,
+        "activeBackupCount": 5,
+        "lockFreeListMs": 4.71,
+        "tempUnhashedScanMs": 162.67,
+        "cleanupPreviewMs": 157.09,
+        "registryUnchanged": true
+      }
     }
   },
   "rawEvidence": {

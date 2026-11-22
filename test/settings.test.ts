@@ -68,6 +68,14 @@ test("default settings and packaged example preserve the established limits", as
       ),
     ),
   );
+  const tuned = parseSettings({
+    lockWaitMs: 15000,
+    sweepCooldownMinutes: 10,
+    autoReclaimStaleLocks: false,
+  });
+  assert.equal(tuned.lockWaitMs, 15000);
+  assert.equal(tuned.sweepCooldownMinutes, 10);
+  assert.equal(tuned.autoReclaimStaleLocks, false);
   assert.equal(example.storageRoot, "~/.pi/agent/file-tools");
   assert.equal(example.preflightPrompt, true);
   assert.deepEqual(example.policies, DEFAULT_POLICIES);
@@ -276,6 +284,10 @@ test("settings reject unknown fields, invalid versions and unsafe policy values"
     { policies: { temp: { maxBytes: 0 } } },
     { policies: { backup: { purgeAfterHours: -1 } } },
     { policies: { temp: { typo: 1 } } },
+    { lockWaitMs: 50 },
+    { lockWaitMs: 100.5 },
+    { sweepCooldownMinutes: -1 },
+    { autoReclaimStaleLocks: "true" },
   ])
     assert.throws(() => parseSettings(value));
 });

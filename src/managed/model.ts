@@ -68,6 +68,10 @@ export interface Item {
   inspectionError?: string;
   lastVerifiedAt?: number;
   linkCount?: number;
+  sessionId?: string;
+  sessionFile?: string;
+  pid?: number;
+  host?: string;
 }
 export interface StoreState {
   version: 1;
@@ -153,6 +157,7 @@ export function planCleanup(
   state: StoreState,
   category: Category,
   now: number,
+  activeSessionIds?: ReadonlySet<string>,
 ): Plan {
   const policy = state.policies[category];
   const items = state.items.filter((i) => i.category === category);
@@ -170,10 +175,16 @@ export function planCleanup(
   const recycle: Plan["recycle"] = [];
   const blocked: string[] = [];
   for (const item of active) {
+    const sessionProtected =
+      category === "temp" &&
+      item.sessionId !== undefined &&
+      activeSessionIds?.has(item.sessionId) === true &&
+      item.expiresAt > now;
     if (
       item.inspectionError !== undefined ||
       item.pinned ||
-      item.leaseUntil > now
+      item.leaseUntil > now ||
+      sessionProtected
     ) {
       blocked.push(item.id);
       continue;
